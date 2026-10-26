@@ -2,8 +2,8 @@
 'use strict';
 /* ============================================================================
    Opal Clip Cloud — zero-dependency YouTube clipper built for Render free tier
-   Target: 512MB RAM | 24x7 (self-ping) | up to 4K | frame-exact re-encode at
-   download time (audio-only tracks stay remuxed — no video = no GOP problem)
+   Target: 512MB RAM | 24x7 (self-ping) | speed-first frame-exact re-encode at
+   download time (ultrafast x264, capped at MAX_RENDER_H; audio-only stays remuxed)
    ============================================================================ */
 
 const http = require('http');
@@ -46,13 +46,17 @@ const CFG = {
   analyzeCacheTtlMs: Math.max(10, +(process.env.ANALYZE_TTL_MIN || 720)) * 60 * 1000,
   clipCacheTtlMs: Math.max(10, +(process.env.CLIP_TTL_MIN || 360)) * 60 * 1000,
   clipCacheMaxBytes: Math.max(0, +(process.env.CLIP_CACHE_MB || 300)) * 1024 * 1024,
-  // --- download-time render (frame-exact re-encode) ---
+  // --- download-time render (frame-exact re-encode, v2.7: speed-first) ---
   ffmpegPath: process.env.FFMPEG_PATH || 'ffmpeg',
-  prerollSec: Math.max(0, +(process.env.PREROLL_SEC || 15)),
+  prerollSec: Math.max(0, +(process.env.PREROLL_SEC || 4)),
+  // never fetch/encode pixels above this height on the free tier (speed + RAM);
+  // raise MAX_RENDER_H on a bigger instance to allow 1440p/4K renders
+  maxRenderH: Math.min(2160, Math.max(144, parseInt(process.env.MAX_RENDER_H, 10) || 1080)),
+  ytdlpTimeoutMs: Math.max(1, +(process.env.YT_TIMEOUT_MIN || 15)) * 60 * 1000,
   encodePreset: (process.env.ENCODE_PRESET || '').trim(),  // override the auto ladder
   encodeCrf: Math.max(0, parseInt(process.env.ENCODE_CRF, 10) || 0),
   encodeThreads: Math.max(0, parseInt(process.env.ENCODE_THREADS, 10) || 0),
-  encodeTimeoutMs: Math.max(5, +(process.env.ENCODE_TIMEOUT_MIN || 50)) * 60 * 1000,
+  encodeTimeoutMs: Math.max(5, +(process.env.ENCODE_TIMEOUT_MIN || 16)) * 60 * 1000,
 };
 
 const state = {
@@ -66,6 +70,27 @@ const state = {
   ytdlpVersion: '',
   bootReady: false,
 };
+
+// Real CPU allowance for the encoder. Container hosts expose many host cores
+// while the cgroup quota is a fraction of ONE core — if x264 spawns a thread
+// per visible core it thrashes the quota and wastes RAM. Read the cgroup quota
+// (v2 then v1), fall back to visible cores, always clamp to 1-4 threads.
+const DETECTED_CPUS = (() => {
+  const clamp = (n) => Math.max(1, Math.min(4, Math.floor(n) || 1));
+  try {
+    const q = String(fs.readFileSync('/sys/fs/cgroup/cpu.max', 'utf8')).trim();
+    if (q && q !== 'max') {
+      const [quota, period] = q.split(/\s+/);
+      if (+quota > 0 && +period > 0) return clamp(+quota / +period);
+    }
+  } catch {}
+  try {
+    const quota = +fs.readFileSync('/sys/fs/cgroup/cpu/cpu.cfs_quota_us', 'utf8');
+    const period = +fs.readFileSync('/sys/fs/cgroup/cpu/cpu.cfs_period_us', 'utf8');
+    if (quota > 0 && period > 0) return clamp(quota / period);
+  } catch {}
+  return clamp(require('os').cpus().length);
+})();
 
 // ---------------------------- small utilities -------------------------------
 const log = (...a) => console.log(new Date().toISOString(), ...a);
@@ -597,9 +622,16 @@ function ytBaseArgs() {
 // the frame-exact render happens afterwards in runFfmpegEncode(). The old
 // container-first chain could silently cap quality (e.g. 4K VP9-only videos
 // falling back to a 1080p MP4), so the ranking stays pure-quality.
+// v2.7: the cap itself is clamped to MAX_RENDER_H (default 1080) — on the
+// 512MB/0.1CPU free tier a >1080p re-encode is hopeless-slow and an OOM risk,
+// so pixels above the cap are simply never fetched (the download itself gets
+// several times faster too). H.264 is preferred over VP9/AV1 at the same cap
+// because its decode is 2-4x faster — less wall time before the first encoded
+// frame. The clip card honestly shows the real rendered height.
 function formatArgsFor(height) {
-  const H = Math.min(2160, Math.max(144, height));
+  const H = Math.min(CFG.maxRenderH, Math.min(2160, Math.max(144, height)));
   const f = [
+    `bestvideo*[height<=${H}][vcodec^=avc1]+bestaudio`,
     `bestvideo*[height<=${H}]+bestaudio`,
     `best[height<=${H}]`,
     `bestvideo*+bestaudio`,
@@ -686,7 +718,8 @@ function execYt(args, job, progressTo) {
       resolve({ code: code === null ? 1 : code, stdout, stderr });
     });
     if (job) childByJob.set(job.id, child);
-    const t = setTimeout(() => { try { child.kill('SIGKILL'); } catch {} }, 55 * 60 * 1000);
+    // hung downloads must not jam the 1-slot queue for an hour (v2.7)
+    const t = setTimeout(() => { try { child.kill('SIGKILL'); } catch {} }, CFG.ytdlpTimeoutMs);
     child.on('close', () => { clearTimeout(t); if (job) childByJob.delete(job.id); });
   });
 }
@@ -745,14 +778,16 @@ async function jobAnalyze(job) {
 //     EXACT requested frame (not the previous keyframe)
 //   * audio is re-encoded to AAC -> priming-sample drift / desync disappears
 //   * -movflags +faststart -> moov atom at the front -> playback starts at once
-// x264 ladder tuned for the free tier (0.1 CPU / 512MB); override per deploy
-// with ENCODE_PRESET / ENCODE_CRF / ENCODE_THREADS if you need to retune.
+// v2.7 SPEED-FIRST settings: veryfast measured MINUTES per short clip on the
+// free tier's shared CPU; ultrafast encodes 3-5x faster, and its near-zero
+// lookahead/reference buffers keep RAM far from the 512MB OOM line. crf 23 is
+// visually clean on a phone. Threads follow the REAL cgroup CPU quota.
+// Override per deploy with ENCODE_PRESET / ENCODE_CRF / ENCODE_THREADS.
 function encodeSettings(h, attempt) {
-  const H = +h || 720;
-  let preset = CFG.encodePreset || (H > 1440 ? 'ultrafast' : H > 1080 ? 'superfast' : 'veryfast');
-  let crf = CFG.encodeCrf || (H > 1440 ? 19 : 18);
-  let threads = CFG.encodeThreads || (H > 1080 ? 2 : 0);
-  if (attempt > 0) { preset = 'ultrafast'; threads = 1; } // memory-safe retry
+  const preset = CFG.encodePreset || 'ultrafast';
+  const crf = CFG.encodeCrf || 23;
+  let threads = CFG.encodeThreads || DETECTED_CPUS;
+  if (attempt > 0) threads = 1; // memory-safe retry
   return { preset, crf, threads };
 }
 
@@ -816,12 +851,13 @@ async function jobClip(job) {
   const { url, start, end, height } = job._input;
   // cache key carries the pipeline version: finished renders replay instantly,
   // but old stream-copy entries (frozen first GOP) are never reused
-  const ckey = `${videoKeyOf(url)}|${(+start).toFixed(2)}|${(+end).toFixed(2)}|${height}|re1`;
+  const ckey = `${videoKeyOf(url)}|${(+start).toFixed(2)}|${(+end).toFixed(2)}|${height}|re2`;
   const cached = await clipCacheGet(ckey);
   if (cached) {
     job.result = {
       file: { name: cached.name, size: cached.size, mime: cached.mime, url: `/file/${job.id}` },
       video: cached.video, clipped: cached.clipped, cached: true,
+      render: cached.render || { mode: 'cache' },
     };
     job._file = cached.path;
     job._cacheKey = ckey;
@@ -865,16 +901,17 @@ async function jobClip(job) {
   const meta = await probeVideo(src);
   const ext = path.extname(src).slice(1).toLowerCase();
 
-  // ---- remux path: audio-only (no video frames = no keyframe problem) or a
-  // source with no video stream — serve yt-dlp's output as-is (original track)
-  if (audioOnly || !meta.height) {
+  // ---- remux path: audio-only clips keep the ORIGINAL track (no video frames
+  // = no keyframe problem, remux is instant). A VIDEO request whose download
+  // came back without a video stream is a hard error in v2.7 — serving the
+  // broken stream-copy file would bring back the frozen-first-GOP bug.
+  if (!audioOnly && !meta.height) {
+    throw httpErr(422, 'Download produced no video stream — try again or pick another quality.');
+  }
+  if (audioOnly) {
     const AUDIO_MIME = { m4a: 'audio/mp4', mp3: 'audio/mpeg', opus: 'audio/ogg', ogg: 'audio/ogg', webm: 'audio/webm', wav: 'audio/wav', aac: 'audio/aac', flac: 'audio/flac' };
-    const mime = audioOnly
-      ? (AUDIO_MIME[ext] || 'application/octet-stream')
-      : (ext === 'webm' ? 'video/webm' : (ext === 'mkv' ? 'video/x-matroska' : 'video/mp4'));
-    const name = audioOnly
-      ? `${sanitizeFilename(job.title || 'clip')} audio ${humanRange(start, end)}.${ext}`
-      : `${sanitizeFilename(job.title || 'clip')} ${meta.height ? meta.height + 'p ' : ''}${humanRange(start, end)}.${ext === 'mkv' ? 'mkv' : ext}`;
+    const mime = AUDIO_MIME[ext] || 'application/octet-stream';
+    const name = `${sanitizeFilename(job.title || 'clip')} audio ${humanRange(start, end)}.${ext}`;
     job.result = {
       file: { name, size: st0.size, mime, url: `/file/${job.id}` },
       video: { height: meta.height, width: meta.width, codec: meta.codec, duration: meta.duration, ext },
@@ -882,7 +919,7 @@ async function jobClip(job) {
       render: { mode: 'remux' },
     };
     job.progress = 100; job.status = 'done';
-    const moved = await clipCachePersist(ckey, src, ext, name, st0.size, mime, job.result.video, job.result.clipped);
+    const moved = await clipCachePersist(ckey, src, ext, name, st0.size, mime, job.result.video, job.result.clipped, job.result.render);
     if (moved) job._file = moved;
     return;
   }
@@ -892,18 +929,38 @@ async function jobClip(job) {
   // KEEPS the original content timestamps (first video pts > 0.5 -> file time
   // == content time, seek directly) or is REBASED to zero (recover the exact
   // offset from duration slack: preroll + actualSpan - requestedSpan).
+  // v2.7: this mapping is only a CANDIDATE — every encode attempt is validated
+  // (real duration + video stream + non-trivial size) and a wrong guess falls
+  // through to the next candidate, so a timeline surprise on any deploy can
+  // never end in "empty file" again.
   const p0 = await probeFirstVideoPts(src);
-  let trimStart;
-  if (isFinite(p0) && p0 > 0.5) {
-    trimStart = start;
-    jobLog(job, `section keeps content timestamps (first pts ${p0.toFixed(2)}s) -> exact seek ${start.toFixed(2)}s`);
-  } else {
-    const requested = end - secStart;
-    const slack = Math.max(0, (meta.duration || 0) - requested);
-    trimStart = Math.min(Math.max(0, (start - secStart) + slack),
-                         Math.max(0, (meta.duration || 0) - want - 0.05));
-    jobLog(job, `section rebased to zero (dur ${meta.duration || 0}s, slack ${slack.toFixed(2)}s) -> trim at ${trimStart.toFixed(2)}s`);
+  const dur = Math.max(0, meta.duration || 0);
+  const requested = end - secStart;
+  const slack = Math.max(0, dur - requested);
+  const trimRebased = Math.min(Math.max(0, (start - secStart) + slack),
+                               Math.max(0, dur - want - 0.05));
+  // content timeline is trusted only when the file clearly keeps content pts
+  // AND actually covers the requested range
+  const contentOk = isFinite(p0) && p0 > 0.5
+    && start + 0.5 >= p0 && (p0 + dur) >= (start + want - 0.5);
+  const cands = [];
+  if (contentOk) cands.push({ trim: start, tag: 'content', dur: want });
+  cands.push({ trim: trimRebased, tag: 'rebased', dur: want });
+  if (!contentOk && dur > 0) {
+    // rebased file but the slack guess looked off — try the raw preroll offset
+    cands.push({ trim: Math.max(0, Math.min(start - secStart, dur - want - 0.05)), tag: 'rebased-raw', dur: want });
   }
+  // last resort: encode from the very start of the file — the clip then begins
+  // up to the preroll early, but it can never come out empty or truncated
+  cands.push({ trim: 0, tag: 'safe', dur: Math.min(dur || want, want + Math.max(0, start - secStart)) });
+  const seen = new Set();
+  const candidates = cands.filter((c) => {
+    const k = c.trim.toFixed(2);
+    if (seen.has(k)) return false;
+    seen.add(k);
+    return true;
+  });
+  jobLog(job, `timeline: firstPts ${isFinite(p0) ? p0.toFixed(2) : 'n/a'}s, dur ${dur.toFixed(2)}s -> candidates ${candidates.map((c) => `${c.tag}@${c.trim.toFixed(2)}s`).join(', ')}`);
 
   // ---- re-encode: frame #1 = clean IDR at the exact timestamp ----
   const out = path.join(dir, 'clip.mp4');
@@ -911,30 +968,45 @@ async function jobClip(job) {
   const ladder = encodeSettings(meta.height, 0);
   const renderInfo = {
     mode: 'encode',
-    timeline: (isFinite(p0) && p0 > 0.5) ? 'content' : 'rebased',
+    timeline: '',
     firstPts: isFinite(p0) ? Math.round(p0 * 100) / 100 : null,
-    trimStart: Math.round(trimStart * 100) / 100,
     want: Math.round(want * 100) / 100,
     preset: ladder.preset, crf: ladder.crf,
+    attempts: [],
   };
-  job.phase = 'encoding';
-  const enc1 = await runFfmpegEncode(encodeArgs(src, out, trimStart, want, meta, title, 0), job, { from: 70, to: 96, want });
-  if (enc1.code !== 0) {
-    jobLog(job, `encode attempt 1 failed (code ${enc1.code}) — retrying with low-memory settings`);
-    job.phase = 'encoding (low memory)';
-    const enc2 = await runFfmpegEncode(encodeArgs(src, out, trimStart, want, meta, title, 1), job, { from: 70, to: 96, want });
-    if (enc2.code !== 0) {
-      const why = (enc2.err || '').split('\n').map((l) => l.trim()).filter(Boolean).slice(-2).join(' ').slice(0, 180);
-      throw httpErr(422, `Rendering failed — ${why || `ffmpeg exited ${enc2.code}`}`);
+  let om = null, st1 = null, lastWhy = '';
+  for (let attempt = 0; attempt < candidates.length; attempt++) {
+    const cand = candidates[attempt];
+    job.phase = attempt === 0 ? 'encoding' : `encoding (retry ${attempt})`;
+    if (attempt > 0) jobLog(job, `encode retry ${attempt}: timeline '${cand.tag}', trim ${cand.trim.toFixed(2)}s`);
+    const enc = await runFfmpegEncode(encodeArgs(src, out, cand.trim, cand.dur, meta, title, attempt), job, { from: 70, to: 96, want: cand.dur });
+    renderInfo.attempts.push(`${cand.tag}:exit${enc.code}`);
+    st1 = await fsp.stat(out).catch(() => null);
+    const sizeOk = !!st1 && st1.size >= 25 * 1024;
+    if (enc.code === 0 && sizeOk) {
+      job.progress = 97; job.phase = 'finalizing';
+      om = await probeVideo(out);
+      // HARD gate (v2.6 only logged a note here — truncation reached users):
+      // a valid render must carry a video stream and (nearly) the full length
+      const durOk = om.height > 0 && (om.duration || 0) >= Math.max(1, want - 1.2);
+      if (durOk) {
+        renderInfo.timeline = cand.tag;
+        renderInfo.trimStart = Math.round(cand.trim * 100) / 100;
+        jobLog(job, `attempt ${attempt + 1} (${cand.tag}) accepted: ${om.height}p, ${(om.duration || 0).toFixed(2)}s, ${(st1.size / 1048576).toFixed(1)}MB`);
+        break;
+      }
+      lastWhy = `invalid output (duration ${(om.duration || 0).toFixed(2)}s, height ${om.height || 0})`;
+      om = null;
+    } else if (enc.code !== 0) {
+      lastWhy = `ffmpeg exit ${enc.code}` + (/killed|signal|abort|memory|cannot allocate/i.test(enc.err || '') ? ' (out of memory)' : '');
+    } else {
+      lastWhy = `output too small (${st1 ? st1.size : 0} bytes)`;
     }
+    jobLog(job, `attempt ${attempt + 1} (${cand.tag}) rejected: ${lastWhy}`);
   }
-  const st1 = await fsp.stat(out).catch(() => null);
-  if (!st1 || st1.size < 1024) throw httpErr(422, 'Rendering produced an empty file.');
-
-  job.progress = 97; job.phase = 'finalizing';
-  const om = await probeVideo(out);
-  if (!om.duration || Math.abs(om.duration - want) > 1.2) {
-    jobLog(job, `duration note: wanted ${want.toFixed(1)}s, got ${om.duration || 0}s`);
+  if (!om) {
+    const why = String(lastWhy || '').slice(0, 160);
+    throw httpErr(422, `Rendering failed — ${why || 'encoder produced no usable output'}`);
   }
   await fsp.rm(src, { force: true }).catch(() => {}); // drop the raw section — halves disk usage
   job._file = out;
@@ -947,18 +1019,18 @@ async function jobClip(job) {
     render: renderInfo,
   };
   job.progress = 100; job.status = 'done';
-  const moved = await clipCachePersist(ckey, out, 'mp4', name, st1.size, 'video/mp4', job.result.video, job.result.clipped);
+  const moved = await clipCachePersist(ckey, out, 'mp4', name, st1.size, 'video/mp4', job.result.video, job.result.clipped, job.result.render);
   if (moved) job._file = moved;
 }
 
 // move a finished clip into the shared disk cache (best-effort). Returns the
 // new path when the file was moved, or null when caching failed.
-async function clipCachePersist(ckey, file, ext, name, size, mime, video, clipped) {
+async function clipCachePersist(ckey, file, ext, name, size, mime, video, clipped, render) {
   try {
     const cachePath = path.join(clipCacheDir, `${hashKey(ckey)}.${ext}`);
     await fsp.mkdir(clipCacheDir, { recursive: true });
     await fsp.rename(file, cachePath);
-    const rec = { path: cachePath, name, size, mime, video, clipped, at: Date.now() };
+    const rec = { path: cachePath, name, size, mime, video, clipped, render: render || null, at: Date.now() };
     clipCache.set(ckey, rec);
     await fsp.writeFile(path.join(clipCacheDir, `${hashKey(ckey)}.json`), JSON.stringify(rec)).catch(() => {});
     return cachePath;
@@ -1403,7 +1475,7 @@ const server = http.createServer(async (req, res) => {
         jobs: { running: runningCount, queued: queue.length },
         warp: { enabled: CFG.warp, active: !!state.connectProxyUrl, error: state.warpError.slice(0, 140) },
         cookies: !!state.cookiesFile,
-        ytdlp: state.ytdlpVersion || '', version: '2.6.0',
+        ytdlp: state.ytdlpVersion || '', version: '2.7.0',
         caches: {
           analyze: analyzeCache.size,
           clips: clipCache.size,
@@ -1418,7 +1490,7 @@ const server = http.createServer(async (req, res) => {
       return sendJson(res, 200, {
         maxClipSeconds: CFG.maxClipSeconds,
         authRequired: !!CFG.apiKey,
-        version: '2.6.0',
+        version: '2.7.0',
       });
     }
 
@@ -1533,7 +1605,9 @@ function serveFile(req, res, job) {
   const f = job.result.file;
   const filePath = job._file;
   fs.stat(filePath, (err, st) => {
-    if (err || !st.isFile()) return sendJson(res, 404, { error: 'File missing (expired)' });
+    // v2.7: a <1KB "file" is never a playable clip — refuse instead of shipping
+    // a broken download (protects stale cache replays too)
+    if (err || !st.isFile() || st.size < 1024) return sendJson(res, 404, { error: 'File missing (expired)' });
     const size = st.size;
     // keep the file alive while it is actively downloaded / previewed
     job.lastAccess = Date.now();
