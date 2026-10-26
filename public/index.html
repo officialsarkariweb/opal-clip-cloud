@@ -95,18 +95,26 @@ video.plv{width:100%;height:100%;display:block;background:#000;object-fit:contai
 <script>
 const $=s=>document.querySelector(s),ic=n=>`<i data-lucide="${n}"></i>`,M=()=>window.Motion&&Motion.animate,LU=()=>window.lucide&&lucide.createIcons();
 const COL=['#6a4cf5','#d44df0','#ff7a3d','#ff5577'],Q=['360p','480p','720p','1080p','1440p','4K','MP3'],MB={'360p':.35,'480p':.6,'720p':1.1,'1080p':2.2,'1440p':4,'4K':8,'MP3':.12};
-let S={view:'link',url:'',meta:null,clips:[],ts:'',q:'1080p',sel:new Set(),timers:[]};
+let S={view:'link',url:'',meta:null,clips:[],ts:'',q:'1080p',sel:new Set(),timers:[],jobs:null,pm:null,pvK:null};
 const STEP={link:0,cut:1,prog:1,clips:2},VIEWS=['link','cut'];
 const fmt=s=>{s=Math.round(s);const h=Math.floor(s/3600),m=Math.floor(s%3600/60),x=s%60,p=n=>String(n).padStart(2,'0');return h?`${h}:${p(m)}:${p(x)}`:`${m}:${p(x)}`};
 const pt=t=>t.split(':').reduce((a,v)=>a*60+parseFloat(v),0),size=(c,q)=>(c.b-c.a)*MB[q]/10;
+const fmtD=s=>{s=Math.max(0,+s||0);const h=Math.floor(s/3600),m=Math.floor(s%3600/60),x=s%60,p=n=>String(n).padStart(2,'0');return h?`${h}:${p(m)}:${p(Math.floor(x))}.${Math.round(x%1*10)}`:`${m}:${p(Math.floor(x))}.${Math.round(x%1*10)}`};
+const ytId=u=>{try{const U=new URL(u),h=U.hostname.replace(/^www\./,'').toLowerCase();if(h==='youtu.be')return(U.pathname.split('/')[1]||'').split(/[/?#]/)[0];if(h==='youtube.com'||h.endsWith('.youtube.com')||h==='youtube-nocookie.com'){if(U.pathname==='/watch')return U.searchParams.get('v')||'';const m=U.pathname.match(/^\/(?:embed|shorts|live|v)\/([^/?#]+)/);if(m)return m[1]}}catch(_){}return''};
+const QH={'360p':360,'480p':480,'720p':720,'1080p':1080,'1440p':1440,'4K':2160,'MP3':'audio'};
+const qOf=()=>QH[S.q]!==undefined?QH[S.q]:2160;
+const needQ=(c,q)=>q==='audio'?!c.audio:(!!c.audio||c.h>q||(c.h>0&&c.h<q&&((S.meta&&+S.meta.hh)||0)>c.h));
+let pvMsg=null;
+const pvStop=()=>{if(pvMsg){removeEventListener('message',pvMsg);pvMsg=null}};
+const pvUrl=(yid,a,b)=>`https://www.youtube-nocookie.com/embed/${yid}?start=${(+a||0).toFixed(2)}&end=${(+b||0).toFixed(2)}&autoplay=1&mute=1&playsinline=1&rel=0&modestbranding=1&enablejsapi=1${/^https?:$/.test(location.protocol)?'&origin='+encodeURIComponent(location.origin):''}`;
 function parse(txt,dur){const ok=[],bad=[];txt.split('\n').map(l=>l.trim()).filter(Boolean).forEach(l=>{const m=l.match(/^([\d:.]+)\s*(?:-|–|—|to)\s*([\d:.]+)$/i);if(m){const a=pt(m[1]),b=pt(m[2]);if(b>a&&b<=dur)return ok.push({a,b,c:COL[ok.length%4]})}bad.push(l)});return{ok,bad}}
 function toast(t){const e=$('#toast');e.textContent=t;e.classList.add('show');clearTimeout(toast.t);toast.t=setTimeout(()=>e.classList.remove('show'),2400)}
 const thErr=el=>{const d=document.createElement('div');d.className='tile';d.innerHTML=ic('play');el.replaceWith(d);LU()};
 const jreq=async(u,m,d)=>{const r=await fetch(u,{method:m||'GET',headers:d?{'Content-Type':'application/json'}:{},body:d?JSON.stringify(d):void 0});if(r.status===401)throw new Error('API key required (X-Api-Key header)');if(!r.ok){let t='';try{t=(await r.json()).error}catch(_){}throw new Error(t||('HTTP '+r.status))}return r.json()};
-const jpoll=async(id,ms)=>{const t0=Date.now();for(;;){const j=await jreq('/api/job/'+id);if(j.status==='done')return j;if(j.status==='error')throw new Error(j.error||'Job failed');if(j.status==='cancelled')throw new Error('Cancelled');if(ms&&Date.now()-t0>ms)throw new Error('Timed out — try again');await new Promise(r=>setTimeout(r,700))}};
+const jpoll=async(id,ms)=>{const t0=Date.now();for(;;){const j=await jreq('/api/job/'+id);if(j.status==='done')return j;if(j.status==='error')throw new Error(j.error||'Job failed');if(j.status==='cancelled')throw new Error('Cancelled');if(ms&&Date.now()-t0>ms)throw new Error('Timed out — try again');await new Promise(r=>setTimeout(r,450))}};
 const tl=(cl,d)=>`<div class="tl">${cl.map(c=>`<i style="left:${c.a/d*100}%;width:${Math.max(1.4,(c.b-c.a)/d*100)}%;background:${c.c}"></i>`).join('')}</div><div class="row meta" style="margin-top:8px"><span>0:00</span><span>${fmt(d)}</span></div>`;
 const dock=h=>{$('#dock').innerHTML=h};
-function go(v){S.view=v;S.timers.forEach(clearInterval);render()}
+function go(v){S.view=v;S.timers.forEach(clearInterval);S.timers=[];pvStop();render()}
 function head(){const k=STEP[S.view],L=['Link','Cut','Download'],b=S.view==='cut'||S.view==='clips';
  $('#hd').innerHTML=`<header><button class="ib ${b?'':'h'}" id="bk" aria-label="Back">${ic('chevron-left')}</button><div class="stp">${L.map((l,i)=>`${i?`<u class="${i<=k?'on':''}"></u>`:''}<button class="${i<k?'done':i===k?'cur':''}" data-k="${i}" ${i<k?'':'tabindex="-1"'}><em>${i<k?ic('check'):i+1}</em><span>${l}</span></button>`).join('')}</div><div></div></header>`}
 function render(){head();dock('');const v=S.view;$('#view').className=v==='clips'?'tall':'';$('#view').innerHTML={link:link,cut:cut,prog:prog,clips:clips}[v]();bind();LU();
@@ -118,60 +126,93 @@ function cut(){const m=S.meta;dock(`<button class="btn" id="go" disabled>${ic('s
 <div class="card"><div id="tlw"></div></div>
 <div class="card"><div class="row" style="margin-bottom:8px"><span class="meta">Timestamps</span><button class="tx" id="smp" style="padding:0">Use sample</button></div><textarea id="ts" placeholder="1:00 - 1:30&#10;2:15 to 2:23&#10;300-320">${S.ts}</textarea></div>
 <div class="ok" id="ok"></div><div class="bad" id="bad"></div>`}
-function prog(){dock(`<button class="btn sec" id="cx">Cancel</button>`);
- return T('Cutting clips',`${S.clips.length} clips in parallel, frame-accurate.`)+`<div class="card"><div class="row meta"><span>Overall</span><span>${S.clips.length} clips</span></div><div class="big"><span id="all">0</span><s>%</s></div><div class="bar"><i id="ob" style="--c:#fff"></i></div></div>
-${S.clips.map((c,i)=>`<div class="card" style="--c:${c.c}"><div class="row"><div class="cl"><span class="dot"></span><b style="font-weight:600">Clip ${i+1}</b></div><span class="meta" id="t${i}">Queued</span></div><div class="bar" style="margin-top:12px"><i id="p${i}"></i></div><div class="row meta" style="margin-top:9px"><span>${fmt(c.a)} to ${fmt(c.b)}</span><span id="n${i}">0%</span></div></div>`).join('')}`}
+function prog(){const P=S.pm||{},list=P.list||[],n=list.length,yid=P.yid||'',c0=S.clips[list[0]]||{};
+ dock(`<button class="btn sec" id="cx">Cancel</button>`);
+ return T(P.h||'Cutting clips',P.s||`${n} clips in parallel, frame-accurate.`)+(yid?`<div class="card"><div class="pl" style="--c:#0099ff"><iframe id="pv" title="Embedded clip preview" allow="autoplay; encrypted-media; picture-in-picture" allowfullscreen referrerpolicy="strict-origin-when-cross-origin" style="width:100%;height:100%;border:0;display:block;background:#000" src="${pvUrl(yid,c0.a,c0.b)}"></iframe></div><div class="row meta" style="margin-top:9px"><span id="pvt">${fmt(c0.a)} → ${fmt(c0.b)} · 360p</span><span>embedded preview</span></div></div>`:'')+`
+<div class="card"><div class="row meta"><span>Overall</span><span>${n} clips</span></div><div class="big"><span id="all">0</span><s>%</s></div><div class="bar"><i id="ob" style="--c:#fff"></i></div></div>
+${list.map((ci,k)=>{const c=S.clips[ci]||{};return `<div class="card" style="--c:${c.c}"><div class="row"><div class="cl"><span class="dot"></span><b style="font-weight:600">Clip ${ci+1}</b></div><span class="meta" id="t${k}">Queued</span></div><div class="bar" style="margin-top:12px"><i id="p${k}"></i></div><div class="row meta" style="margin-top:9px"><span>${fmt(c.a)} to ${fmt(c.b)}</span><span id="n${k}">0%</span></div></div>`}).join('')}`}
 function clips(){dock(`<div class="q">${Q.map(x=>`<button class="chip ${x===S.q?'on':''}" data-q="${x}">${x}</button>`).join('')}</div><button class="btn" id="dl"></button>`);
  return T(`${S.clips.length} clips ready`,'Pick a quality, then download everything or select specific clips.')+`<div class="row" style="margin-bottom:12px"><span class="meta" id="cnt"></span><div class="cl" style="gap:8px"><button class="chip" id="all2" hidden>Select all</button><button class="chip" id="mode">Select</button></div></div>
-${S.clips.map((c,i)=>`<div class="card" id="c${i}" style="--c:${c.c}"><div class="pl">${c.f?`<video class="plv" src="${c.f}" controls playsinline preload="metadata"${S.meta.thumb?` poster="${S.meta.thumb}"`:''}></video>`:''}</div>
-<div class="pick" data-t="${i}"><div><b>Clip ${i+1}</b><div class="meta">${fmt(c.a)} to ${fmt(c.b)}${c.rd?` · real ${fmt(c.rd)}`:''}${c.h?` · ${c.h}p`:''} · <span id="sz${i}"></span></div></div><span class="ck">${ic('check')}</span><button class="ib ds" data-d="${i}" aria-label="Download clip">${ic('download')}</button></div></div>`).join('')}`}
+${S.clips.map((c,i)=>`<div class="card" id="c${i}" style="--c:${c.c}"><div class="pl">${c.f?(c.audio?`${S.meta&&S.meta.thumb?`<img src="${S.meta.thumb}" alt="" referrerpolicy="no-referrer" style="width:100%;height:100%;object-fit:cover;display:block" onerror="this.remove()">`:''}<audio controls preload="metadata" src="${c.f}" style="position:absolute;left:12px;right:12px;bottom:10px"></audio>`:`<video class="plv" src="${c.f}" controls playsinline preload="metadata"${S.meta&&S.meta.thumb?` poster="${S.meta.thumb}"`:''}></video>`):''}</div>
+<div class="pick" data-t="${i}"><div><b>Clip ${i+1}</b><div class="meta">${fmt(c.a)} to ${fmt(c.b)}${c.rd?` · real ${fmt(c.rd)}`:''}${c.audio?' · audio':(c.h?` · ${c.h}p`:'')} · <span id="sz${i}"></span></div></div><span class="ck">${ic('check')}</span><button class="ib ds" data-d="${i}" aria-label="Download clip">${ic('download')}</button></div></div>`).join('')}`}
 function upd(){const sm=S.selecting,N=S.clips.length,n=sm?S.sel.size:N,all=S.sel.size===N;let tot=0;S.clips.forEach((c,i)=>{const on=sm&&S.sel.has(i),z=S.meta&&S.meta.tbr&&S.q===S.meta.qq?(c.b-c.a)*S.meta.tbr/8000:size(c,S.q);$('#c'+i).classList.toggle('sel',on);$('#sz'+i).textContent=z.toFixed(1)+' MB';if(!sm||on)tot+=z});
  $('#view').classList.toggle('selmode',!!sm);$('#cnt').textContent=sm?`${S.sel.size} of ${N} selected`:`${N} clips`;$('#all2').hidden=!sm;$('#all2').textContent=all?'Clear all':'Select all';$('#mode').textContent=sm?'Cancel':'Select';const b=$('#dl');b.disabled=!n;
  b.innerHTML=n?`${ic(n>1?'archive':'download')}${n>1?(sm?`Download ${n} clips as ZIP`:'Download all as ZIP'):'Download clip'} · ${tot.toFixed(1)} MB`:'Select clips to download';LU()}
 function bind(){
  if($('#bk'))$('#bk').onclick=()=>go(S.view==='clips'?'cut':'link');
  document.querySelectorAll('.stp .done').forEach(b=>b.onclick=()=>go(VIEWS[+b.dataset.k]));
- if(S.view==='link'){const u=$('#url');$('#pst').onclick=async()=>{try{u.value=await navigator.clipboard.readText()}catch(e){toast('Long-press the field to paste')}};
+ if(S.view==='link'){const u=$('#url');$('#pst').onclick=async()=>{let v='';try{v=String(await navigator.clipboard.readText()||'').trim();u.value=v}catch(e){toast('Long-press the field to paste');return}
+   if(/^https?:\/\/\S+\.\S+/.test(v)){const a=$('#an');if(a&&!a.disabled){a.click();return}}
+   if(v)toast('Paste a valid video link')};
   $('#an').onclick=async()=>{S.url=u.value.trim();if(!/^https?:\/\/\S+\.\S+/.test(S.url)){toast('Paste a valid video link');u.focus();return}
-   $('#an').disabled=1;$('#sk').innerHTML='<div class="skel"></div><div class="skel" style="height:44px"></div>';
+   $('#an').disabled=1;const yid=ytId(S.url);
+   $('#sk').innerHTML=yid?`<div class="card vid" style="margin-top:12px"><img class="tile" src="https://i.ytimg.com/vi/${yid}/hqdefault.jpg" alt="" referrerpolicy="no-referrer" onerror="this.closest('.card').style.display='none'"><div><b>Analyzing…</b><div class="meta">Fetching video info</div></div></div><div class="skel" style="height:44px"></div>`:'<div class="skel"></div><div class="skel" style="height:44px"></div>';
    try{const a=await jreq('/api/analyze','POST',{url:S.url});const j=await jpoll(a.jobId,300000);const m=j.result||{};
     const h=+m.height||0,qq=h>=2000?'4K':h>=1400?'1440p':h>=1000?'1080p':h>=700?'720p':h>=470?'480p':'360p';
-    S.meta={title:m.title||'Video',ch:m.uploader||new URL(S.url).hostname.replace('www.',''),dur:+m.duration||0,tbr:+m.tbr||0,qq:qq,thumb:m.id?('/api/thumb/'+m.id):(m.thumbnail||'')};
+    S.meta={title:m.title||'Video',ch:m.uploader||new URL(S.url).hostname.replace('www.',''),dur:+m.duration||0,tbr:+m.tbr||0,qq:qq,hh:h,thumb:m.id?('/api/thumb/'+m.id):(m.thumbnail||''),id:m.id||yid};
     if(h>0)S.q=qq;
     go('cut')}catch(e){toast(String(e.message||'Analyze failed').slice(0,90));$('#an').disabled=0;$('#sk').innerHTML=''}}}
  if(S.view==='cut'){const t=$('#ts'),g=$('#go');const chk=()=>{S.ts=t.value;const r=parse(t.value,S.meta.dur);S.clips=r.ok;$('#tlw').innerHTML=tl(r.ok,S.meta.dur);const tot=r.ok.reduce((s,c)=>s+c.b-c.a,0);$('#ok').textContent=r.ok.length?`${r.ok.length} clip${r.ok.length>1?'s':''} · ${fmt(tot)} total`:'';$('#bad').textContent=r.bad.length?`Can’t read ${r.bad.length} line${r.bad.length>1?'s':''}: ${r.bad.slice(0,2).join(', ')}`:'';g.disabled=!r.ok.length;g.lastElementChild.textContent=r.ok.length?`Cut ${r.ok.length} clip${r.ok.length>1?'s':''}`:'Cut clips'};
-  t.oninput=chk;$('#smp').onclick=()=>{t.value='1:00 - 1:30\n2:15 to 2:23\n300-320\n12:10 - 12:55';chk()};chk();g.onclick=()=>{go('prog');run()}}
- if(S.view==='prog')$('#cx').onclick=()=>{if(S.jobs)S.jobs.forEach(j=>{if(j.id&&j.st==='q')fetch('/api/job/'+j.id,{method:'DELETE'}).catch(()=>{})});go('cut')};
+  t.oninput=chk;$('#smp').onclick=()=>{t.value='1:00 - 1:30\n2:15 to 2:23\n300-320\n12:10 - 12:55';chk()};chk();g.onclick=()=>startRender(S.clips.map((_,i)=>i),'auto')}
+ if(S.view==='prog'){$('#cx').onclick=()=>{if(S.jobs)S.jobs.forEach(j=>{if(j.id&&j.st==='q')fetch('/api/job/'+j.id,{method:'DELETE'}).catch(()=>{})});go((S.pm&&S.pm.back)||'cut')};
+  const f=$('#pv');
+  if(f){const P=S.pm||{},c0=S.clips[(P.list||[])[0]]||{};f.dataset.st=c0.a||0;f.dataset.en=c0.b||0;S.pvK=0;
+   f.addEventListener('load',()=>{try{f.contentWindow.postMessage(JSON.stringify({event:'listening'}),'*')}catch(_){}});
+   if(pvMsg)removeEventListener('message',pvMsg);
+   pvMsg=ev=>{try{if(!f.contentWindow||ev.source!==f.contentWindow)return;const d=typeof ev.data==='string'?JSON.parse(ev.data):ev.data;if(!d||d.event!=='infoDelivery')return;const i=d.info||{};
+    if(typeof i.currentTime==='number'){const t=$('#pvt');if(t)t.textContent=`▶ ${fmtD(i.currentTime)} / ${fmt(f.dataset.en||0)} · 360p`}
+    if(i.playerState===0){try{f.contentWindow.postMessage(JSON.stringify({event:'command',func:'seekTo',args:[+(f.dataset.st||0),true]}),'*');f.contentWindow.postMessage(JSON.stringify({event:'command',func:'playVideo',args:[]}),'*')}catch(_){}}
+   }catch(_){}};
+   addEventListener('message',pvMsg)}}
  if(S.view==='clips'){upd();
-  document.querySelectorAll('[data-t]').forEach(e=>e.onclick=ev=>{if(!S.selecting||ev.target.closest('.ds'))return;const i=+e.dataset.t;S.sel.has(i)?S.sel.delete(i):S.sel.add(i);upd()});$('#mode').onclick=()=>{S.selecting=!S.selecting;S.sel=new Set();upd()};document.querySelectorAll('[data-d]').forEach(b=>b.onclick=async()=>{const c=S.clips[+b.dataset.d];if(!c||!c.f)return toast('Clip not ready');try{const r=await fetch(c.f,{method:'HEAD'});if(!r.ok)throw 0;location.href=c.f+'?dl=1'}catch(_){toast('Clip expired — cut again')}});
+  document.querySelectorAll('[data-t]').forEach(e=>e.onclick=ev=>{if(!S.selecting||ev.target.closest('.ds'))return;const i=+e.dataset.t;S.sel.has(i)?S.sel.delete(i):S.sel.add(i);upd()});$('#mode').onclick=()=>{S.selecting=!S.selecting;S.sel=new Set();upd()};document.querySelectorAll('[data-d]').forEach(b=>b.onclick=async()=>{const i=+b.dataset.d,c=S.clips[i];if(!c||!c.f)return toast('Clip not ready');
+   const q=qOf();
+   if(needQ(c,q))return startRender([i],q,'dl',[i]);
+   try{const r=await fetch(c.f,{method:'HEAD'});if(!r.ok)throw 0;location.href=c.f+'?dl=1'}catch(_){toast('Clip expired — cut again')}});
   $('#all2').onclick=()=>{S.sel=S.sel.size===S.clips.length?new Set():new Set(S.clips.map((_,i)=>i));upd()};
   document.querySelectorAll('[data-q]').forEach(b=>b.onclick=()=>{S.q=b.dataset.q;document.querySelectorAll('[data-q]').forEach(x=>x.classList.toggle('on',x===b));upd()});
-  $('#dl').onclick=async()=>{const sm=S.selecting,ids=S.clips.filter((c,i)=>!sm||S.sel.has(i)).map(c=>c.f?c.f.split('/').pop():'').filter(Boolean);if(!ids.length)return toast('Select clips to download');
-   if(ids.length===1){location.href='/file/'+ids[0]+'?dl=1';return}
-   const db=$('#dl');db.disabled=1;
-   try{toast('Preparing ZIP of '+ids.length+' clips…');const z=await jreq('/api/zip','POST',{ids:ids});const j=await jpoll(z.jobId,300000);location.href=j.result.file.url+'?dl=1'}catch(e){toast(String(e.message||'ZIP failed').slice(0,90))}finally{db.disabled=0}};}}
-async function run(){const t0=Date.now();const js=S.clips.map(()=>({p:0,st:'q',id:'',f:'',busy:0,msg:'',rd:0,h:0}));S.jobs=js;
- for(let i=0;i<S.clips.length;i++){const c=S.clips[i];
-  try{const r=await jreq('/api/clip','POST',{url:S.url,start:c.a,end:c.b,title:S.meta.title});js[i].id=r.jobId}catch(e){js[i].st='e';js[i].msg=e.message||'Failed'}}
+  $('#dl').onclick=async()=>{const sm=S.selecting,idxs=S.clips.map((c,i)=>i).filter(i=>S.clips[i].f&&(!sm||S.sel.has(i)));if(!idxs.length)return toast('Select clips to download');
+   const q=qOf(),need=idxs.filter(i=>needQ(S.clips[i],q));
+   if(need.length)return startRender(need,q,'dl',idxs);
+   await doDownload(idxs)};}}
+function startRender(list,quality,then,dlIdxs){const P=S.pm={list:list.slice(),quality,then,dlIdxs,back:S.view,yid:ytId(S.url)};
+ const n=P.list.length;
+ if(then==='dl'){P.h=`Rendering ${S.q}`;P.s=`${n} clip${n>1?'s':''} at ${S.q} — original quality, exact timestamps.`}
+ go('prog');run()}
+async function doDownload(idxs){const items=(idxs||[]).filter(i=>S.clips[i]&&S.clips[i].f);if(!items.length)return toast('No clips ready');
+ if(items.length===1){location.href=S.clips[items[0]].f+'?dl=1';return}
+ const ids=[...new Set(items.map(i=>S.clips[i].f.split('/').pop()).filter(Boolean))];
+ if(ids.length===1){location.href='/file/'+ids[0]+'?dl=1';return}
+ const db=$('#dl');if(db)db.disabled=1;
+ try{toast('Preparing ZIP of '+ids.length+' clips…');const z=await jreq('/api/zip','POST',{ids:ids});const j=await jpoll(z.jobId,300000);location.href=j.result.file.url+'?dl=1'}catch(e){toast(String(e.message||'ZIP failed').slice(0,90))}finally{if(db)db.disabled=0}}
+async function run(){const P=S.pm||{},list=P.list||[],q=P.quality||'auto',cs=list.map(i=>S.clips[i]);
+ const t0=Date.now();const js=cs.map(()=>({p:0,st:'q',sv:'queued',id:'',f:'',busy:0,msg:'',rd:0,h:0}));S.jobs=js;
+ for(let i=0;i<cs.length;i++){const c=cs[i];
+  try{const r=await jreq('/api/clip','POST',{url:S.url,start:c.a,end:c.b,title:S.meta.title,quality:q});js[i].id=r.jobId}catch(e){js[i].st='e';js[i].msg=e.message||'Failed'}}
  const tick=async i=>{const s=js[i];if(s.busy||!s.id||s.st!=='q')return;s.busy=1;
-  try{const j=await jreq('/api/job/'+s.id);
+  try{const j=await jreq('/api/job/'+s.id);s.sv=j.status||'queued';
    if(j.status==='done'){s.st='d';s.f=(j.result&&j.result.file&&j.result.file.url)||'';s.p=100;const v=(j.result&&j.result.video)||{};s.rd=+v.duration||0;s.h=+v.height||0}
    else if(j.status==='error'||j.status==='cancelled'){s.st='e';s.msg=j.error||'Failed'}
    else s.p=Math.max(s.p,Math.min(99,Math.round(+j.progress||0)))}catch(_){}
   s.busy=0};
+ const pvGo=k=>{if(!P.yid||S.pvK===k)return;const c=cs[k];if(!c)return;S.pvK=k;const f=$('#pv');if(!f)return;
+  f.dataset.st=c.a;f.dataset.en=c.b;f.src=pvUrl(P.yid,c.a,c.b);const t=$('#pvt');if(t)t.textContent=`${fmt(c.a)} → ${fmt(c.b)} · 360p`};
  const id=setInterval(()=>{js.forEach((s,i)=>tick(i));
   let sum=0,fin=0,ok=0;
   js.forEach((s,i)=>{const b=$('#p'+i);if(!b)return;
    if(s.st==='d'){s.p=100;fin++;ok++}else if(s.st==='e')fin++;
    sum+=s.p;b.style.width=s.p+'%';$('#n'+i).textContent=Math.floor(s.p)+'%';
    $('#t'+i).innerHTML=s.st==='e'?'<span style="color:#ff5577">Failed</span>':s.p>=100?'<span style="color:var(--ok)">Done</span>':s.p>45?'Encoding':s.p>0?'Cutting':'Queued'});
+  if(P.yid){const k=js.findIndex(s=>s.st==='q');if(k>=0)pvGo(k)}
   const a=js.length?Math.floor(sum/js.length):0;if($('#all')){$('#all').textContent=a;$('#ob').style.width=a+'%'}
-  if(Date.now()-t0>15*60000){clearInterval(id);toast('Timed out — try fewer or shorter clips');go('cut');return}
+  if(Date.now()-t0>15*60000){clearInterval(id);toast('Timed out — try fewer or shorter clips');go(P.back||'cut');return}
   if(fin>=js.length){clearInterval(id);S.jobs=null;
-   if(!ok){const m=(js.find(x=>x.st==='e')||{}).msg||'Clipping failed';toast(String(m).slice(0,90));go('cut');return}
-   if(ok<js.length)toast((js.length-ok)+' clip'+(js.length-ok>1?'s':'')+' failed');
-   S.clips=S.clips.map((c,i)=>js[i].st==='d'?Object.assign({},c,{f:js[i].f,rd:js[i].rd||0,h:js[i].h||0}):null).filter(Boolean);
-   setTimeout(()=>{S.sel=new Set();S.selecting=false;go('clips')},700)}},160);S.timers.push(id)}
+   list.forEach((ci,k)=>{if(js[k].st==='d'){const c=S.clips[ci];c.f=js[k].f;c.rd=js[k].rd||0;c.h=js[k].h||0;c.audio=q==='audio';c.rqH=q==='auto'?2160:(q==='audio'?'audio':q)}});
+   const okN=list.filter((ci,k)=>js[k].st==='d').length;
+   if(!okN){const m=(js.find(x=>x.st==='e')||{}).msg||'Clipping failed';toast(String(m).slice(0,90));S.pm=null;go(P.back||'cut');return}
+   if(okN<list.length)toast((list.length-okN)+' clip'+(list.length-okN>1?'s':'')+' failed');
+   if(P.then==='dl'){const qn=qOf(),tgt=(P.dlIdxs||list).filter(i=>!needQ(S.clips[i],qn));S.pm=null;doDownload(tgt);setTimeout(()=>{S.sel=new Set();S.selecting=false;go('clips')},600)}
+   else{S.pm=null;setTimeout(()=>{S.sel=new Set();S.selecting=false;go('clips')},700)}}},160);S.timers.push(id)}
 addEventListener('error',e=>{if(e&&e.message)toast(String(e.message).slice(0,80))});
 addEventListener('unhandledrejection',e=>{const r=e&&e.reason;toast(r&&r.message?String(r.message).slice(0,80):'Request failed')});
 render();

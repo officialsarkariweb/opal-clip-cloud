@@ -754,12 +754,15 @@ async function jobClip(job) {
   job.phase = 'downloading'; job.progress = 1;
 
   const outTpl = path.join(dir, 'clip.%(ext)s');
+  const audioOnly = height === 'audio';
   const args = [
     ...ytBaseArgs(),
     '--download-sections', `*${start}-${end}`,
     // NOTE: no --force-keyframes-at-cuts — cuts stay keyframe-aligned so the
     // section download + merge are a pure stream-copy (fast, ~0 RAM overhead)
-    ...formatArgsFor(height === 'auto' ? 2160 : height),
+    ...(audioOnly
+      ? ['-f', 'bestaudio/best', '--concurrent-fragments', '4'] // original audio stream, remux only
+      : formatArgsFor(height === 'auto' ? 2160 : height)),
     '-o', outTpl,
     url,
   ];
@@ -779,8 +782,13 @@ async function jobClip(job) {
   job.progress = 96; job.phase = 'probing';
   const meta = await probeVideo(file);
   const ext = path.extname(file).slice(1).toLowerCase();
-  const mime = ext === 'webm' ? 'video/webm' : (ext === 'mkv' ? 'video/x-matroska' : 'video/mp4');
-  const name = `${sanitizeFilename(job.title || 'clip')} ${meta.height ? meta.height + 'p ' : ''}${humanRange(start, end)}.${ext === 'mkv' ? 'mkv' : ext}`;
+  const AUDIO_MIME = { m4a: 'audio/mp4', mp3: 'audio/mpeg', opus: 'audio/ogg', ogg: 'audio/ogg', webm: 'audio/webm', wav: 'audio/wav', aac: 'audio/aac', flac: 'audio/flac' };
+  const mime = audioOnly
+    ? (AUDIO_MIME[ext] || 'application/octet-stream')
+    : (ext === 'webm' ? 'video/webm' : (ext === 'mkv' ? 'video/x-matroska' : 'video/mp4'));
+  const name = audioOnly
+    ? `${sanitizeFilename(job.title || 'clip')} audio ${humanRange(start, end)}.${ext}`
+    : `${sanitizeFilename(job.title || 'clip')} ${meta.height ? meta.height + 'p ' : ''}${humanRange(start, end)}.${ext === 'mkv' ? 'mkv' : ext}`;
 
   job.result = {
     file: { name, size: st.size, mime, url: `/file/${job.id}` },
@@ -1223,7 +1231,7 @@ const server = http.createServer(async (req, res) => {
         jobs: { running: runningCount, queued: queue.length },
         warp: { enabled: CFG.warp, active: !!state.connectProxyUrl, error: state.warpError.slice(0, 140) },
         cookies: !!state.cookiesFile,
-        ytdlp: state.ytdlpVersion || '', version: '2.3.0',
+        ytdlp: state.ytdlpVersion || '', version: '2.4.0',
         caches: {
           analyze: analyzeCache.size,
           clips: clipCache.size,
@@ -1238,7 +1246,7 @@ const server = http.createServer(async (req, res) => {
       return sendJson(res, 200, {
         maxClipSeconds: CFG.maxClipSeconds,
         authRequired: !!CFG.apiKey,
-        version: '2.3.0',
+        version: '2.4.0',
       });
     }
 
@@ -1297,8 +1305,12 @@ const server = http.createServer(async (req, res) => {
         if (end - start < 1) throw httpErr(400, 'Clip must be at least 1 second');
         let height = 'auto';
         if (body.quality && body.quality !== 'auto') {
-          height = parseInt(body.quality, 10);
-          if (!(height >= 144 && height <= 2160)) throw httpErr(400, 'quality must be "auto" or a height like 2160');
+          if (body.quality === 'audio') {
+            height = 'audio'; // original audio track only (remux, no re-encode)
+          } else {
+            height = parseInt(body.quality, 10);
+            if (!(height >= 144 && height <= 2160)) throw httpErr(400, 'quality must be "auto", "audio", or a height like 2160');
+          }
         }
         if (queue.length + runningCount >= CFG.maxQueue) throw httpErr(429, 'Server busy — try again shortly');
         const job = newJob('clip', { url: safeUrl, start, end, height });
