@@ -1,0 +1,21 @@
+# Render.com blueprint — deploy with "New +" → "Blueprint" or manual Docker setup
+services:
+  - type: web
+    name: opal-clip-cloud
+    runtime: docker
+    plan: free
+    healthCheckPath: /healthz
+    autoDeploy: false
+    envVars:
+      - key: NODE_ENV
+        value: production
+      # WARP tunnel ON by default (auto-registers a free Cloudflare WARP account
+      # at boot to bypass YouTube's datacenter-IP bot wall). Set to "off" to disable.
+      - key: WARP
+        value: on
+      # Optional hardening / tuning — set in Render dashboard if needed:
+      # - key: API_KEY            # locks all POST/file endpoints to this key
+      # - key: MAX_CLIP_SECONDS   # default 600 (10 min)
+      # - key: PROXY_URL          # your own http/socks5 proxy (disables WARP)
+      # - key: COOKIES            # Netscape cookies.txt content
+      # - key: SELF_PING          # "off" to disable keep-alive pings
