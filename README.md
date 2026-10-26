@@ -1,6 +1,6 @@
 # Opal Clip Cloud ✂️
 
-Lightweight self-hosted **video clipper** (YouTube + 1000+ sites) built to run **24x7 on Render's free tier** — 512MB RAM, no sleep, **always original quality up to 4K** (pure stream copy, never re-encoded, never downgraded to a lower stream), with **video thumbnails**, a **real embedded preview player (accurate real timestamps)** and **3-layer caching** so repeat traffic costs almost nothing.
+Lightweight self-hosted **video clipper** (YouTube + 1000+ sites) built to run **24x7 on Render's free tier** — 512MB RAM, no sleep, **always original quality up to 4K** (pure stream copy, never re-encoded, never downgraded to a lower stream), with **video thumbnails**, a **360p YouTube preview embedded on every clip card (starting at your exact timestamp)** and **3-layer caching** so repeat traffic costs almost nothing. **Cutting is instant** — nothing is rendered until you actually click Download, and then the clip is produced **from your exact timestamp at the chosen quality**.
 
 Built for: lowest resource use, zero paid services, mobile-first **Opal Clipper** UI.
 
@@ -21,7 +21,7 @@ Built for: lowest resource use, zero paid services, mobile-first **Opal Clipper*
 3. Runtime: **Docker** (auto-detected from `Dockerfile`). Plan: **Free**.
 4. (Optional) `render.yaml` blueprint import does the same.
 5. Deploy. First boot takes ~1 min (image pull + WARP registration).
-6. Open the URL — paste a YouTube link, **Analyze** (real title/channel/duration load, **thumbnail shows in the video box**), type timestamps like `1:00 - 1:30` (one clip per line), **Cut clips** (live real progress), then **Download** individual clips or all as **ZIP** — always at the video's original quality. When clips are ready, each card shows a **real embedded video preview** (native player, true timeline + the clip's real probed duration and resolution).
+6. Open the URL — paste a YouTube link, **Analyze** (real title/channel/duration load, **thumbnail shows in the video box**), type timestamps like `1:00 - 1:30` (one clip per line), **Cut clips** — the clip cards appear **instantly** (nothing is rendered yet), each with a **360p YouTube preview embedded right at your start timestamp**. When you click **Download** (single clip, or ZIP for all/selected), the clip is rendered **at that moment** from your exact timestamp at the **chosen quality** — a live progress bar runs inside the card, then the file downloads. Always the video's original quality at that resolution.
 
 Verify health: `GET /healthz` → `{"ok":true,"warp":{"active":true},...}`
 
@@ -51,7 +51,7 @@ Verify health: `GET /healthz` → `{"ok":true,"warp":{"active":true},...}`
 ## API
 
 ```
-GET  /healthz               → {"ok":true,"ramMB":...,"warp":{...},"caches":{...},"version":"2.3.0"}
+GET  /healthz               → {"ok":true,"ramMB":...,"warp":{...},"caches":{...},"version":"2.5.0"}
 GET  /api/capabilities      → {"maxClipSeconds":600,"authRequired":false}
 GET  /api/thumb/:videoId    → YouTube thumbnail JPEG (proxied, cached 24h in the browser)
 POST /api/analyze {url}                      → {"jobId":"…"}
@@ -94,7 +94,7 @@ render.yaml        — Render blueprint
 ## Notes & limits
 
 - **Chosen quality, always as the original stream:** downloads render **at download time** in the quality you pick — `bestvideo*[height<=H]+bestaudio` selected and merged with a stream-copy **remux** (never re-encoded), so a 360p pick is the *original* 360p stream, a 4K pick is the exact original 4K stream (VP9/AV1 + Opus lands as `.webm`, H.264+AAC as `.mp4`). The chip matching the video's real quality is auto-selected after Analyze; repeat downloads of the same range+quality replay instantly from the clip cache. `MP3` yields the **original audio track** (`.m4a`/`.opus`, remux — no lossy re-encode).
-- **360p embedded preview while clips render:** while the server downloads/merges your clips, the progress view shows an **embedded 360p YouTube preview of the exact range** (`start`/`end` at your timestamps, muted autoplay, loops the range, live timestamp counter). It appears during the render/download — not before — and follows the clip currently being cut. The actual download always renders at the chosen quality.
+- **Instant cut, lazy render:** the **Cut clips** step does no work at all — cards appear immediately with a **360p YouTube embed starting at your exact timestamp** (`start`/`end` pinned to your range). The actual download/render happens **only when you click Download**: the clip is fetched from the same timestamp at the chosen quality, with a live progress bar inside the card. Leaving the clips view cancels pending renders; the ZIP button renders all needed clips first ("Rendering 2/5…"), then streams them as one store-mode ZIP.
 - Clips are **keyframe-aligned** (fast, no re-encode): the real length of a clip can differ slightly from the requested range — the UI therefore shows the clip's **real probed duration** (`real 0:13`) next to the requested range, and the embedded preview's timeline is the true file timeline.
 - 10-min 4K clips can be 1–3GB; download time depends on YouTube throughput — the job runs asynchronously with live progress, so long jobs are fine.
 - Files auto-delete after 20 idle minutes; an active download keeps its file alive.

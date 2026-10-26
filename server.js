@@ -1231,7 +1231,7 @@ const server = http.createServer(async (req, res) => {
         jobs: { running: runningCount, queued: queue.length },
         warp: { enabled: CFG.warp, active: !!state.connectProxyUrl, error: state.warpError.slice(0, 140) },
         cookies: !!state.cookiesFile,
-        ytdlp: state.ytdlpVersion || '', version: '2.4.0',
+        ytdlp: state.ytdlpVersion || '', version: '2.5.0',
         caches: {
           analyze: analyzeCache.size,
           clips: clipCache.size,
@@ -1246,7 +1246,7 @@ const server = http.createServer(async (req, res) => {
       return sendJson(res, 200, {
         maxClipSeconds: CFG.maxClipSeconds,
         authRequired: !!CFG.apiKey,
-        version: '2.4.0',
+        version: '2.5.0',
       });
     }
 
