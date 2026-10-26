@@ -41,6 +41,10 @@ const CFG = {
   externalUrl: (process.env.RENDER_EXTERNAL_URL || '').replace(/\/+$/, ''),
   selfUpdate: (process.env.YT_SELF_UPDATE || 'on') !== 'off',
   httpTimeoutMs: 25 * 1000,
+  // --- caches (load handling on the free tier) ---
+  analyzeCacheTtlMs: Math.max(10, +(process.env.ANALYZE_TTL_MIN || 720)) * 60 * 1000,
+  clipCacheTtlMs: Math.max(10, +(process.env.CLIP_TTL_MIN || 360)) * 60 * 1000,
+  clipCacheMaxBytes: Math.max(0, +(process.env.CLIP_CACHE_MB || 300)) * 1024 * 1024,
 };
 
 const state = {
@@ -216,9 +220,12 @@ async function cleanupJobFiles(job) {
   try { await fsp.rm(job._dir, { recursive: true, force: true }); } catch {}
 }
 
-// sweeper: TTL cleanup of files + stale jobs
+// sweeper: TTL cleanup of files + stale jobs + cache eviction
 setInterval(async () => {
   const now = Date.now();
+  await clipCacheEvict().catch(() => {});
+  pruneDiskCache(thumbCacheDir, 400);
+  pruneDiskCache(analyzeCacheDir, 512);
   for (const job of jobs.values()) {
     const age = now - (job.lastAccess || job.doneAt || job.createdAt);
     if ((job.status === 'done' || job.status === 'error' || job.status === 'cancelled') && age > CFG.jobTtlMs) {
@@ -231,16 +238,214 @@ setInterval(async () => {
     const oldest = [...jobs.values()].sort((a, b) => a.createdAt - b.createdAt).slice(0, jobs.size - 200);
     for (const j of oldest) { await cleanupJobFiles(j); jobs.delete(j.id); }
   }
-  // orphan dir cleanup
+  // orphan dir cleanup (the cache/ tree is managed by its own evictor)
   try {
-    const entries = await fsp.readdir(CFG.workDir);
+    const entries = await fsp.readdir(CFG.workDir).catch(() => []);
     for (const e of entries) {
+      if (e === 'cache') continue;
       const p = path.join(CFG.workDir, e);
       const st = await fsp.stat(p).catch(() => null);
       if (st && now - st.mtimeMs > CFG.jobTtlMs + 5 * 60 * 1000) await fsp.rm(p, { recursive: true, force: true }).catch(() => {});
     }
   } catch {}
 }, 60 * 1000).unref();
+
+// ---------------------------- caches (load handling) --------------------------
+// Three layers keep repeated work off the CPU/network of the 512MB free tier:
+//   1. analyze cache — yt-dlp metadata per video (memory + disk, TTL)
+//   2. clip cache    — finished clip files keyed by url|start|end|format;
+//                      repeat cuts of the same range replay instantly (LRU + size cap)
+//   3. thumb cache   — /api/thumb/:id JPEG proxy (memory + disk + 24h browser cache)
+const cacheRoot = path.join(CFG.workDir, 'cache');
+const analyzeCacheDir = path.join(cacheRoot, 'analyze');
+const clipCacheDir = path.join(cacheRoot, 'clips');
+const thumbCacheDir = path.join(cacheRoot, 'thumb');
+const analyzeCache = new Map(); // key -> {result, at}
+const clipCache = new Map();    // key -> {path, name, size, mime, video, clipped, at}
+const thumbMem = new Map();     // id -> {buf, type}
+const THUMB_MEM_MAX_BYTES = 4 * 1024 * 1024;
+
+function ytIdOf(rawUrl) {
+  try {
+    const u = new URL(rawUrl);
+    const h = u.hostname.replace(/^www\./, '').toLowerCase();
+    if (h === 'youtu.be') return (u.pathname.split('/')[1] || '').split(/[/?#]/)[0];
+    if (h === 'youtube.com' || h.endsWith('.youtube.com') || h === 'youtube-nocookie.com') {
+      if (u.pathname === '/watch') return u.searchParams.get('v') || '';
+      const m = u.pathname.match(/^\/(?:embed|shorts|live|v)\/([^/?#]+)/);
+      if (m) return m[1];
+    }
+  } catch {}
+  return '';
+}
+
+// stable cache key: YouTube collapses to its video id (t=, list=, etc. ignored);
+// other sites keep origin+path minus volatile query params
+function videoKeyOf(rawUrl) {
+  const id = ytIdOf(rawUrl);
+  if (id) return 'yt:' + id;
+  try {
+    const u = new URL(rawUrl);
+    const keep = [...u.searchParams.entries()]
+      .filter(([k]) => !/^(t|time|start|timestamp|list|index|feature|si|pp|utm_[a-z]+)$/i.test(k))
+      .sort((a, b) => a[0].localeCompare(b[0]));
+    return u.origin.replace(/^www\./, '') + u.pathname + (keep.length ? '?' + keep.map(([k, v]) => `${k}=${v}`).join('&') : '');
+  } catch { return String(rawUrl); }
+}
+
+const hashKey = (s) => crypto.createHash('sha1').update(s).digest('hex').slice(0, 24);
+
+async function analyzeCacheGet(key) {
+  const hit = analyzeCache.get(key);
+  if (hit) {
+    if (Date.now() - hit.at < CFG.analyzeCacheTtlMs) return hit.result;
+    analyzeCache.delete(key);
+  }
+  try {
+    const p = path.join(analyzeCacheDir, hashKey(key) + '.json');
+    const rec = JSON.parse(await fsp.readFile(p, 'utf8'));
+    if (rec && Date.now() - rec.at < CFG.analyzeCacheTtlMs) {
+      analyzeCache.set(key, rec);
+      return rec.result;
+    }
+    await fsp.rm(p, { force: true }).catch(() => {});
+  } catch {}
+  return null;
+}
+
+async function analyzeCacheSet(key, result) {
+  const rec = { result, at: Date.now() };
+  analyzeCache.set(key, rec);
+  if (analyzeCache.size > 256) { // prune oldest entries — memory stays flat
+    const oldest = [...analyzeCache.entries()].sort((a, b) => a[1].at - b[1].at).slice(0, analyzeCache.size - 256);
+    for (const [k] of oldest) analyzeCache.delete(k);
+  }
+  try {
+    await fsp.mkdir(analyzeCacheDir, { recursive: true });
+    await fsp.writeFile(path.join(analyzeCacheDir, hashKey(key) + '.json'), JSON.stringify(rec));
+  } catch {}
+}
+
+async function clipCacheGet(key) {
+  const hit = clipCache.get(key);
+  if (hit) {
+    if (Date.now() - hit.at < CFG.clipCacheTtlMs) return hit;
+    clipCache.delete(key);
+  }
+  try {
+    const p = path.join(clipCacheDir, hashKey(key) + '.json');
+    const rec = JSON.parse(await fsp.readFile(p, 'utf8'));
+    if (rec && Date.now() - rec.at < CFG.clipCacheTtlMs &&
+        await fsp.stat(rec.path).then((s) => s.size === rec.size).catch(() => false)) {
+      clipCache.set(key, rec);
+      return rec;
+    }
+    if (rec) {
+      await fsp.rm(rec.path, { force: true }).catch(() => {});
+      await fsp.rm(p, { force: true }).catch(() => {});
+    }
+  } catch {}
+  return null;
+}
+
+// TTL + total-size eviction for cached clips (runs inside the 60s sweeper)
+async function clipCacheEvict() {
+  const now = Date.now();
+  let total = 0;
+  for (const [k, rec] of [...clipCache.entries()]) {
+    if (now - rec.at > CFG.clipCacheTtlMs) {
+      await fsp.rm(rec.path, { force: true }).catch(() => {});
+      clipCache.delete(k);
+    } else total += rec.size || 0;
+  }
+  if (total > CFG.clipCacheMaxBytes) {
+    const byAge = [...clipCache.entries()].sort((a, b) => a[1].at - b[1].at);
+    for (const [k, rec] of byAge) {
+      if (total <= CFG.clipCacheMaxBytes) break;
+      total -= rec.size || 0;
+      await fsp.rm(rec.path, { force: true }).catch(() => {});
+      clipCache.delete(k);
+    }
+  }
+}
+
+async function pruneDiskCache(dir, maxFiles) {
+  try {
+    const names = await fsp.readdir(dir);
+    if (names.length <= maxFiles) return;
+    const st = await Promise.all(names.map((n) => fsp.stat(path.join(dir, n)).catch(() => null)));
+    const byAge = names.map((n, i) => ({ n, m: st[i] ? st[i].mtimeMs : 0 })).sort((a, b) => a.m - b.m);
+    for (const { n } of byAge.slice(0, names.length - maxFiles)) {
+      await fsp.rm(path.join(dir, n), { force: true }).catch(() => {});
+    }
+  } catch {}
+}
+
+async function fetchThumb(id) {
+  const cands = [
+    `https://i.ytimg.com/vi/${id}/maxresdefault.jpg`,
+    `https://i.ytimg.com/vi/${id}/hqdefault.jpg`,
+  ];
+  for (const u of cands) {
+    try {
+      const r = await fetchWithTimeout(u, { timeoutMs: 12 * 1000 });
+      if (r.status !== 200) continue;
+      const type = String(r.headers.get('content-type') || '');
+      if (!/^image\//i.test(type)) continue;
+      const buf = Buffer.from(await r.arrayBuffer());
+      if (buf.length < 2048) continue; // maxres placeholder image
+      return { buf, type };
+    } catch {}
+  }
+  return null;
+}
+
+// public thumbnail proxy: strict id pattern, fixed host (i.ytimg.com) — no SSRF
+// surface; served with a 24h immutable browser cache so repeat views cost zero
+async function serveThumb(req, res, id) {
+  let rec = thumbMem.get(id);
+  if (!rec) {
+    const p = path.join(thumbCacheDir, id + '.jpg');
+    const buf = await fsp.readFile(p).catch(() => null);
+    if (buf && buf.length > 2048) {
+      rec = { buf, type: 'image/jpeg' };
+    } else {
+      const got = await fetchThumb(id);
+      if (!got) {
+        // last resort: let the browser fetch the CDN image directly
+        res.writeHead(302, { Location: `https://i.ytimg.com/vi/${id}/hqdefault.jpg`, 'Cache-Control': 'public, max-age=600' });
+        return res.end();
+      }
+      rec = got;
+      try {
+        await fsp.mkdir(thumbCacheDir, { recursive: true });
+        await fsp.writeFile(p, rec.buf);
+      } catch {}
+    }
+    // memory cap (LRU-ish): never let thumbs eat the 512MB budget
+    let mem = 0;
+    for (const r of thumbMem.values()) mem += r.buf.length;
+    for (const [k, r] of thumbMem) {
+      if (mem <= THUMB_MEM_MAX_BYTES) break;
+      mem -= r.buf.length;
+      thumbMem.delete(k);
+    }
+    thumbMem.set(id, rec);
+  }
+  const etag = `"th-${id}-${rec.buf.length}"`;
+  if (req.headers['if-none-match'] === etag) {
+    res.writeHead(304, { ETag: etag, 'Cache-Control': 'public, max-age=86400, immutable' });
+    return res.end();
+  }
+  res.writeHead(200, {
+    'Content-Type': rec.type || 'image/jpeg',
+    'Content-Length': rec.buf.length,
+    'Cache-Control': 'public, max-age=86400, immutable',
+    'ETag': etag,
+  });
+  if (req.method === 'HEAD') return res.end();
+  res.end(rec.buf);
+}
 
 // ---------------------------- static asset (index.html) ---------------------
 let assetHtml = Buffer.alloc(0);
@@ -483,6 +688,15 @@ function execYt(args, job, progressTo) {
 async function jobAnalyze(job) {
   job.phase = 'analyzing';
   const { url } = job._input;
+  // analyze cache: repeat lookups of the same video skip yt-dlp entirely
+  const akey = videoKeyOf(url);
+  const cached = await analyzeCacheGet(akey);
+  if (cached) {
+    job.result = { ...cached, cached: true };
+    jobLog(job, 'analysis served from cache');
+    job.progress = 100; job.phase = 'cache hit'; job.status = 'done';
+    return;
+  }
   const res = await runYt([...ytBaseArgs(), '-J', url], job, 0);
   const combined = res.stdout + res.stderr;
   if (res.code !== 0) throw httpErr(422, friendlyYtError(combined || `yt-dlp exited ${res.code}`));
@@ -504,17 +718,36 @@ async function jobAnalyze(job) {
     duration: info.duration || 0,
     uploader: info.uploader || info.channel || '',
     thumbnail: (info.thumbnails || []).length ? info.thumbnails[info.thumbnails.length - 1].url : '',
+    id: ytIdOf(url),
     heights: heights.slice(0, 12),
     max4k: heights.includes(2160),
     height: heights[0] || 0,
     tbr,
   };
   job.progress = 100; job.status = 'done';
+  await analyzeCacheSet(akey, job.result);
 }
 
 // ---------------------------- clip job ---------------------------------------
 async function jobClip(job) {
   const { url, start, end, height } = job._input;
+  // clip cache: an identical cut (same video + range + format) replays instantly
+  // with zero re-download — this is what keeps load flat when users retry or
+  // re-cut the same segments
+  const ckey = `${videoKeyOf(url)}|${(+start).toFixed(2)}|${(+end).toFixed(2)}|${height}`;
+  const cached = await clipCacheGet(ckey);
+  if (cached) {
+    job.result = {
+      file: { name: cached.name, size: cached.size, mime: cached.mime, url: `/file/${job.id}` },
+      video: cached.video, clipped: cached.clipped, cached: true,
+    };
+    job._file = cached.path;
+    job._cacheKey = ckey;
+    job._dir = ''; // shared cache file — never removed by job cleanup
+    jobLog(job, 'clip served from cache');
+    job.progress = 100; job.phase = 'cache hit'; job.status = 'done';
+    return;
+  }
   const dir = path.join(CFG.workDir, job.id);
   await fsp.mkdir(dir, { recursive: true });
   job._dir = dir;
@@ -555,6 +788,19 @@ async function jobClip(job) {
     clipped: { start, end },
   };
   job.progress = 100; job.status = 'done';
+
+  // persist into the clip cache: MOVE the finished file into cache/clips/ so the
+  // next request for the same cut is served straight from disk (best-effort)
+  try {
+    const cachePath = path.join(clipCacheDir, `${hashKey(ckey)}.${ext}`);
+    await fsp.mkdir(clipCacheDir, { recursive: true });
+    await fsp.rename(file, cachePath);
+    job._file = cachePath;
+    const rec = { path: cachePath, name, size: st.size, mime, video: job.result.video, clipped: job.result.clipped, at: Date.now() };
+    clipCache.set(ckey, rec);
+    await fsp.writeFile(path.join(clipCacheDir, `${hashKey(ckey)}.json`), JSON.stringify(rec)).catch(() => {});
+    jobLog(job, 'cached for instant replay');
+  } catch { /* cache is best-effort — the clip itself already succeeded */ }
 }
 
 function probeVideo(file) {
@@ -570,7 +816,7 @@ function probeVideo(file) {
         resolve({
           height: v.height || 0, width: v.width || 0,
           codec: v.codec_name || '',
-          duration: Math.round(parseFloat((j.format || {}).duration || v.duration || 0)),
+          duration: Math.round(parseFloat((j.format || {}).duration || v.duration || 0) * 10) / 10,
         });
       } catch { resolve({}); }
     });
@@ -977,7 +1223,13 @@ const server = http.createServer(async (req, res) => {
         jobs: { running: runningCount, queued: queue.length },
         warp: { enabled: CFG.warp, active: !!state.connectProxyUrl, error: state.warpError.slice(0, 140) },
         cookies: !!state.cookiesFile,
-        ytdlp: state.ytdlpVersion || '', version: '2.2.0',
+        ytdlp: state.ytdlpVersion || '', version: '2.3.0',
+        caches: {
+          analyze: analyzeCache.size,
+          clips: clipCache.size,
+          clipBytesMB: Math.round([...clipCache.values()].reduce((a, r) => a + (r.size || 0), 0) / 1048576),
+          thumbs: thumbMem.size,
+        },
       });
     }
     if (req.method === 'GET' && (p === '/' || p === '/index.html')) return serveAsset(req, res);
@@ -986,9 +1238,16 @@ const server = http.createServer(async (req, res) => {
       return sendJson(res, 200, {
         maxClipSeconds: CFG.maxClipSeconds,
         authRequired: !!CFG.apiKey,
-        version: '2.2.0',
+        version: '2.3.0',
       });
     }
+
+    // public YouTube thumbnail proxy — cached server-side + 24h browser cache.
+    // Deliberately unauthenticated: it only fronts the public i.ytimg.com CDN
+    // with a strict id pattern (no SSRF surface), so <img>/<video poster> tags
+    // keep working even when API_KEY is set.
+    const mThumb = p.match(/^\/api\/thumb\/([A-Za-z0-9_-]{5,32})$/);
+    if (mThumb && (req.method === 'GET' || req.method === 'HEAD')) return serveThumb(req, res, mThumb[1]);
 
     if (p.startsWith('/api/')) {
       if (!authOk(req)) throw httpErr(401, 'Invalid or missing X-Api-Key header');
@@ -1094,13 +1353,14 @@ function serveFile(req, res, job) {
     const size = st.size;
     // keep the file alive while it is actively downloaded / previewed
     job.lastAccess = Date.now();
+    if (job._cacheKey) { const rec = clipCache.get(job._cacheKey); if (rec) rec.at = Date.now(); }
     fsp.utimes(filePath, new Date(), new Date()).catch(() => {});
     const range = String(req.headers.range || '');
     const headersBase = {
       'Content-Type': f.mime,
       'Accept-Ranges': 'bytes',
       'Content-Disposition': `${(req.url || '').includes('dl=1') ? 'attachment' : 'inline'}; filename="${f.name.replace(/"/g, '')}"; filename*=UTF-8''${encodeURIComponent(f.name)}`,
-      'Cache-Control': 'private, max-age=600',
+      'Cache-Control': 'private, max-age=3600',
     };
     const m = range.match(/bytes=(\d*)-(\d*)/);
     if (m) {

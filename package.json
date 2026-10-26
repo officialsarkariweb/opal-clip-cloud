@@ -1,7 +1,7 @@
 {
   "name": "opal-clip-cloud",
-  "version": "2.2.0",
-  "description": "Lightweight YouTube video clipper — zero-dependency Node.js server for Render free tier (512MB, 24x7, always original quality up to 4K)",
+  "version": "2.3.0",
+  "description": "Lightweight YouTube video clipper — zero-dependency Node.js server for Render free tier (512MB, 24x7, always original quality up to 4K, thumbnails + real preview + 3-layer caching)",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
