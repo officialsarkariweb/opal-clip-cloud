@@ -65,6 +65,7 @@
   a{color:var(--acc);text-decoration:none}
   .spin{display:inline-block;width:13px;height:13px;border:2px solid rgba(255,255,255,.25);border-top-color:#fff;border-radius:50%;animation:sp .7s linear infinite;vertical-align:-2px;margin-right:7px}
   @keyframes sp{to{transform:rotate(360deg)}}
+  .gear{flex:0 0 auto;padding:9px 12px;font-size:16px;line-height:1}
   .preset{display:grid;grid-template-columns:repeat(4,1fr);gap:6px;margin-top:8px}
   .preset button{padding:8px 4px;font-size:11.5px;background:var(--card2);border:1px solid var(--line);color:var(--mut);border-radius:8px}
   .preset button b{display:block;font-size:13px;color:var(--txt)}
@@ -78,10 +79,22 @@
       <h1>Opal <span>Clip</span></h1>
       <div class="sub">YouTube clipper · up to 4K · original quality</div>
     </div>
+    <button class="btn-s gear" id="btnSettings" title="Settings">⚙</button>
     <div style="display:flex;align-items:center;gap:6px"><div class="dot" id="dot"></div></div>
   </header>
 
   <div class="msg" id="msg"></div>
+
+  <div class="card hide" id="cardSettings">
+    <label>YouTube login cookies <span id="cookStatus" style="text-transform:none"></span></label>
+    <div class="info" style="margin:0 0 8px">Fixes "Sign in to confirm you're not a bot" errors (needed when the host blocks the server's tunnel). How: desktop Chrome → install the <a href="https://chromewebstore.google.com/detail/get-cookiestxt-locally/cclelndahbckbenkjhflpdbgdldlbecc" target="_blank" rel="noopener">Get cookies.txt LOCALLY</a> extension → open youtube.com logged in → export → paste the whole file content below.</div>
+    <textarea id="cookies" rows="6" placeholder="Paste cookies.txt content here…" style="width:100%;background:var(--card2);border:1px solid var(--line);color:var(--txt);border-radius:11px;padding:12px;font-size:12px;font-family:monospace;outline:none"></textarea>
+    <div class="row" style="margin-top:10px">
+      <button class="btn-s" id="btnCookSave">Save cookies</button>
+      <button class="btn-s" id="btnCookClear">Remove</button>
+    </div>
+    <div class="info" style="margin-top:8px">Cookies stay in server memory only (RAM, auto-cleared on restart). Tip: use a spare Google account.</div>
+  </div>
 
   <div class="card" id="cardUrl">
     <label>Video URL</label>
@@ -142,7 +155,7 @@ const msg=(t,cls)=>{const m=$('msg');m.className='msg '+(cls||'err');m.innerHTML
 const clearMsg=()=>$('msg').className='msg';
 const apiKey=localStorage.getItem('opal_key')||'';
 const headers={'Content-Type':'application/json',...(apiKey?{'X-Api-Key':apiKey}:{})};
-let caps={maxClipSeconds:600},videoInfo=null,pollTimer=null,curJob=null;
+let caps={maxClipSeconds:600},videoInfo=null,pollTimer=null,curJob=null,healthCache=null;
 
 function fmt(s){s=Math.max(0,Math.round(s));const h=Math.floor(s/3600),m=Math.floor(s%3600/60),x=s%60;
   return (h?h+':':'')+(h?String(m).padStart(2,'0'):m)+':'+String(x).padStart(2,'0')}
@@ -157,8 +170,16 @@ async function api(path,opts){const r=await fetch(path,{...opts,headers});
   if(!r.ok)throw new Error(j.error||('HTTP '+r.status));return j}
 
 async function health(){try{const h=await(await fetch('/healthz')).json();
+  healthCache=h;
   $('dot').classList.toggle('on',h.ok);
   if(h.warp&&h.warp.enabled)document.title='Opal Clip — 4K Clipper'+(h.warp.active?' 🛡':'');
+  const st=$('cookStatus');
+  if(st)st.textContent=h.cookies?'· ACTIVE ✔':'· not set';
+  // warn when the server can't tunnel AND has no cookies (bot-wall likely)
+  const atRisk=h.warp&&h.warp.enabled&&!h.warp.active&&!h.cookies;
+  if(atRisk&&$('cardSettings').classList.contains('hide')&&$('msg').className==='msg'){
+    msg('⚠️ This server has no working tunnel to YouTube (host may block UDP). If Analyze fails with a bot-check error, open ⚙ Settings and paste your YouTube cookies.','info');
+  }
 }catch{$('dot').classList.remove('on')}}
 health();setInterval(health,30000);
 
@@ -168,18 +189,36 @@ health();setInterval(health,30000);
 }catch{}})();
 
 $('url').value=localStorage.getItem('opal_url')||'';
-$('paste').onclick=async()=>{try{const t=await navigator.clipboard.readText();$('url').value=t.trim();$('url').dispatchEvent(new Event('input'))}catch{msg('Clipboard blocked — paste manually'}};
+$('paste').onclick=async()=>{try{const t=await navigator.clipboard.readText();$('url').value=t.trim();$('url').dispatchEvent(new Event('input'))}catch{msg('Clipboard blocked — paste manually')}};
 $('url').addEventListener('input',()=>localStorage.setItem('opal_url',$('url').value));
 $('url').addEventListener('keydown',e=>{if(e.key==='Enter')$('btnAnalyze').click()});
+
+$('btnSettings').onclick=()=>{$('cardSettings').classList.toggle('hide');
+  if(!$('cardSettings').classList.contains('hide')){clearMsg();$('cardSettings').scrollIntoView({behavior:'smooth'})}};
+$('btnCookSave').onclick=async()=>{
+  const v=$('cookies').value.trim();
+  if(!v)return msg('Paste the cookies.txt content first');
+  $('btnCookSave').disabled=true;
+  try{const r=await api('/api/cookies',{method:'POST',body:JSON.stringify({cookies:v})});
+    msg('✅ Cookies installed ('+r.lines+' lines). Try Analyze now!','info');
+    $('cookies').value='';$('cardSettings').classList.add('hide');health();
+  }catch(e){msg('❌ '+esc(e.message))}
+  $('btnCookSave').disabled=false;
+};
+$('btnCookClear').onclick=async()=>{
+  try{await api('/api/cookies',{method:'DELETE'});msg('Cookies removed','info');health();}
+  catch(e){msg('❌ '+esc(e.message))}
+};
 
 $('btnAnalyze').onclick=async()=>{
   clearMsg();const url=$('url').value.trim();
   if(!/^https?:\/\//i.test(url))return msg('Paste a valid video URL (https://…)');
   $('btnAnalyze').disabled=true;$('btnAnalyze').innerHTML='<span class="spin"></span>Analyzing…';
+  msg('⏳ Analyzing…','info');
   try{
     const {jobId}=await api('/api/analyze',{method:'POST',body:JSON.stringify({url})});
-    const j=await poll(jobId,120000);
-    videoInfo=j.result;
+    const j=await poll(jobId,300000);
+    videoInfo=j.result;clearMsg();
     $('vtitle').textContent=videoInfo.title;
     $('vinfo').textContent=(videoInfo.uploader?videoInfo.uploader+' · ':'')+videoInfo.heights.length+' qualities';
     $('vdur').textContent=fmt(videoInfo.duration||0);
@@ -194,7 +233,9 @@ $('btnAnalyze').onclick=async()=>{
     $('end').value=videoInfo.duration?fmt(Math.min(30,videoInfo.duration)):'0:30';
     buildQuick();buildPresets();
     $('cardVideo').scrollIntoView({behavior:'smooth'});
-  }catch(e){msg('❌ '+esc(e.message))}
+  }catch(e){
+    msg('❌ '+esc(e.message)+(/bot check/i.test(e.message)?'<br>👉 Fix: ⚙ Settings → paste YouTube cookies → Analyze again.':''));
+  }
   $('btnAnalyze').disabled=false;$('btnAnalyze').textContent='Analyze';
 };
 
@@ -237,8 +278,10 @@ function poll(jobId,timeoutMs){return new Promise((resolve,reject)=>{
         $('fill').style.width=j.progress+'%';
         $('eta').textContent=j.status==='queued'?'':'elapsed '+fmt((Date.now()-t0)/1000);
         $('phint').textContent=j.status==='queued'?'Waiting for a free slot…':'Downloading only the selected seconds — fast!';
+      } else if(j.status==='running'||j.status==='queued'){
+        msg('⏳ Analyzing… '+(j.phase&&j.phase!=='queued'?'('+esc(j.phase)+')':''),'info');
       }
-      if(j.status==='done')return resolve(j);
+      if(j.status==='done'){clearMsg();return resolve(j)}
       if(j.status==='error'||j.status==='cancelled')return reject(new Error(j.error||('Job '+j.status)+(j.detail?' — '+j.detail[j.detail.length-1]:'')));
       if(Date.now()-t0>timeoutMs)return reject(new Error('Timed out waiting for the job'));
       pollTimer=setTimeout(tick,j.status==='queued'&&j.type==='analyze'?1500:1200);

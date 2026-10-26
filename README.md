@@ -88,3 +88,10 @@ render.yaml        — Render blueprint
 ## License
 
 MIT
+
+## Troubleshooting
+
+**Analyze does nothing / hangs / bot-check error**
+- v2.0 had a frontend JS bug (unclosed paren) — **update to v2.1+** (Render: Manual Deploy → Deploy latest commit).
+- If the host blocks outbound UDP, the built-in WARP tunnel can't come up (check `/healthz` → `warp.active: false`). Fix in 10 seconds: click **⚙ Settings** in the app → paste your YouTube `cookies.txt` content (export with the *Get cookies.txt LOCALLY* browser extension while logged in to youtube.com). Or set the `COOKIES` env var to the same content.
+- `WARP_ENDPOINT` env accepts a comma-separated list of `IP:PORT` endpoints (tried in rotation; default list included).
