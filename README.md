@@ -1,8 +1,8 @@
 # Opal Clip Cloud ✂️
 
-Lightweight self-hosted **video clipper** (YouTube + 1000+ sites) built to run **24x7 on Render's free tier** — 512MB RAM, no sleep, up to **4K original quality**.
+Lightweight self-hosted **video clipper** (YouTube + 1000+ sites) built to run **24x7 on Render's free tier** — 512MB RAM, no sleep, **always original quality up to 4K** (pure stream copy, never re-encoded, never downgraded to a lower stream).
 
-Built for: lowest resource use, zero paid services, mobile-friendly UI.
+Built for: lowest resource use, zero paid services, mobile-first **Opal Clipper** UI.
 
 ## Why it stays awake and cheap
 
@@ -21,9 +21,11 @@ Built for: lowest resource use, zero paid services, mobile-friendly UI.
 3. Runtime: **Docker** (auto-detected from `Dockerfile`). Plan: **Free**.
 4. (Optional) `render.yaml` blueprint import does the same.
 5. Deploy. First boot takes ~1 min (image pull + WARP registration).
-6. Open the URL — paste a YouTube link, Analyze, pick quality (Auto = original best), set start/end, clip, download.
+6. Open the URL — paste a YouTube link, **Analyze** (real title/channel/duration load), type timestamps like `1:00 - 1:30` (one clip per line), **Cut clips** (live real progress), then **Download** individual clips or all as **ZIP** — always at the video's original quality.
 
 Verify health: `GET /healthz` → `{"ok":true,"warp":{"active":true},...}`
+
+> **Already deployed?** After pushing new code: Render dashboard → your service → **Manual Deploy → Deploy latest commit** (autoDeploy is off in `render.yaml`), then **hard-refresh** the page (Ctrl+Shift+R) to bust the 5-minute HTML cache.
 
 > **Free-hours math:** Render gives 750 instance-hours/month; a 31-day month is 744h — so a single 24x7 keep-alive service fits inside the free quota (barely). If you ever exceed it, the service pauses until the next month.
 
@@ -37,24 +39,29 @@ Verify health: `GET /healthz` → `{"ok":true,"warp":{"active":true},...}`
 | `API_KEY` | – | If set, all POST + file endpoints require `X-Api-Key` header (recommended for public URLs). |
 | `MAX_CLIP_SECONDS` | `600` | Max clip duration (10 min). |
 | `MAX_CONCURRENT` | `1` | Parallel jobs. 1 is safest for 512MB. |
-| `QUEUE_CAP` | `8` | Waiting queue depth. |
-| `JOB_TTL_MIN` | `20` | Minutes before finished files are auto-deleted. |
+| `QUEUE_CAP` | `24` | Waiting queue depth. |
+| `JOB_TTL_MIN` | `20` | Minutes before finished files are auto-deleted (refreshed while a download is active). |
 | `SELF_PING` | `on` | Keep-alive self-ping every 9 min (uses `RENDER_EXTERNAL_URL`). |
 | `YT_SELF_UPDATE` | `on` | Daily yt-dlp binary self-update. |
-| `WARP_ENDPOINT` | `162.159.192.1:2408` | WARP peer endpoint (IP:port). |
+| `WARP_ENDPOINT` | rotation list | WARP peer endpoints (IP:PORT, comma-separated, tried in rotation). |
 
 ## API
 
 ```
-GET  /healthz               → {"ok":true,"ramMB":...,"warp":{...}}
+GET  /healthz               → {"ok":true,"ramMB":...,"warp":{...},"version":"2.2.0"}
 GET  /api/capabilities      → {"maxClipSeconds":600,"authRequired":false}
 POST /api/analyze {url}                      → {"jobId":"…"}
-POST /api/clip {url,start,end,quality,title} → {"jobId":"…"}
-     start/end: seconds ("90") or "1:30" / "1:02:03" — quality: "auto" or 2160|1440|1080|…
+     result: {title,duration,uploader,height,tbr,heights[],max4k,thumbnail}
+POST /api/clip {url,start,end,title,quality} → {"jobId":"…"}
+     start/end: seconds ("90") or "1:30" / "1:02:03"
+     quality: omit (or "auto") = ALWAYS ORIGINAL best video+audio (recommended)
+     result: {file:{name,size,mime,url},video:{height,width,codec,ext,duration}}
+POST /api/zip {ids:[clipJobId,…]}           → {"jobId":"…"}  (store-mode ZIP, ≤24 clips)
 GET  /api/job/:id           → {status,progress,phase,result|error}
 DELETE /api/job/:id         → cancel running job
-GET  /file/:id              → the clip (Range supported)
-GET  /file/:id?dl=1         → force download
+GET  /file/:id              → the clip/zip (Range supported)
+HEAD /file/:id              → existence + size check
+GET  /file/:id?dl=1         → force download (Content-Disposition: attachment)
 ```
 
 All POST + `/file` routes require `X-Api-Key` when `API_KEY` env is set.
@@ -80,9 +87,10 @@ render.yaml        — Render blueprint
 
 ## Notes & limits
 
+- **Always original quality:** the format chain ranks purely by quality (`bestvideo*+bestaudio`) and merges with a stream-copy remux — the clip is the exact original stream (e.g. 4K VP9/AV1 + Opus lands as `.webm`, H.264+AAC lands as `.mp4`). The quality chips in the UI only drive the **size estimate**; downloads never drop to a lower stream. The chip matching the video's real quality is auto-selected after Analyze, and its size estimate uses the video's **real bitrate**.
 - Clips are **keyframe-aligned** (fast, no re-encode): cut points may be off by up to ~2s.
-- Formats are constrained to mp4/webm families so the merge is a pure **stream copy** — 4K VP9 clips land as `.webm` (plays everywhere on Android/Chrome; 1080p H.264 lands as `.mp4`).
 - 10-min 4K clips can be 1–3GB; download time depends on YouTube throughput — the job runs asynchronously with live progress, so long jobs are fine.
+- Files auto-delete after 20 idle minutes; an active download keeps its file alive.
 - Use responsibly and respect content creators' rights and site terms.
 
 ## License
@@ -91,7 +99,12 @@ MIT
 
 ## Troubleshooting
 
-**Analyze does nothing / hangs / bot-check error**
-- v2.0 had a frontend JS bug (unclosed paren) — **update to v2.1+** (Render: Manual Deploy → Deploy latest commit).
-- If the host blocks outbound UDP, the built-in WARP tunnel can't come up (check `/healthz` → `warp.active: false`). Fix in 10 seconds: click **⚙ Settings** in the app → paste your YouTube `cookies.txt` content (export with the *Get cookies.txt LOCALLY* browser extension while logged in to youtube.com). Or set the `COOKIES` env var to the same content.
+**Analyze shows an error / bot-check message**
+- If the host blocks outbound UDP, the built-in WARP tunnel can't come up (check `/healthz` → `warp.active: false`). Fix: set the **`COOKIES` env var** in the Render dashboard to your YouTube `cookies.txt` content (export with the *Get cookies.txt LOCALLY* browser extension while logged in to youtube.com), or set `PROXY_URL`. Then redeploy.
 - `WARP_ENDPOINT` env accepts a comma-separated list of `IP:PORT` endpoints (tried in rotation; default list included).
+- After redeploying, **hard-refresh** the browser (Ctrl+Shift+R) — the old HTML can be cached for up to 5 minutes.
+
+**Version history**
+- **2.2** — exact **Opal Clipper** UI wired to the real backend (real analyze/cut/progress/download), always-original-quality format chain, `/api/zip` (store-mode), real-bitrate size estimates, HEAD + TTL-refresh, WARP stale-account boot fix.
+- **2.1** — frontend syntax fix (dead Analyze button), WARP endpoint rotation, cookies API.
+- **2.0** — initial release.

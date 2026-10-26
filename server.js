@@ -34,7 +34,7 @@ const CFG = {
   cookies: (process.env.COOKIES || '').trim(), // raw Netscape cookies.txt content
   apiKey: (process.env.API_KEY || '').trim(),
   maxClipSeconds: Math.max(10, +(process.env.MAX_CLIP_SECONDS || 600)),
-  maxQueue: Math.max(1, +(process.env.QUEUE_CAP || 8)),
+  maxQueue: Math.max(1, +(process.env.QUEUE_CAP || 24)),
   maxConcurrent: Math.max(1, +(process.env.MAX_CONCURRENT || 1)),
   jobTtlMs: Math.max(2, +(process.env.JOB_TTL_MIN || 20)) * 60 * 1000,
   selfPing: (process.env.SELF_PING || 'on') !== 'off',
@@ -195,6 +195,7 @@ function jobPublic(job) {
   if (job.type === 'clip' && job.status === 'done') {
     out.result = job.result; // includes {file:{name,size,mime,url}, video:{height,codec,duration}}
   }
+  if (job.type === 'zip' && job.status === 'done') out.result = job.result;
   if (job.status === 'error' && job.logs.length) out.detail = job.logs.slice(-3);
   return out;
 }
@@ -219,7 +220,7 @@ async function cleanupJobFiles(job) {
 setInterval(async () => {
   const now = Date.now();
   for (const job of jobs.values()) {
-    const age = now - (job.doneAt || job.createdAt);
+    const age = now - (job.lastAccess || job.doneAt || job.createdAt);
     if ((job.status === 'done' || job.status === 'error' || job.status === 'cancelled') && age > CFG.jobTtlMs) {
       await cleanupJobFiles(job);
       jobs.delete(job.id);
@@ -378,19 +379,21 @@ function ytBaseArgs() {
   return args;
 }
 
-// format chain guarantees same-family merges -> pure stream-copy, no re-encode
+// format chain: ALWAYS the ORIGINAL quality — best video + best audio ranked
+// purely by quality. The old container-first chain could silently cap quality
+// (e.g. 4K VP9-only videos falling back to a 1080p MP4). yt-dlp merges with a
+// pure stream-copy remux; --merge-output-format lets it pick the first container
+// that can hold both streams (webm for vp9/av01+opus, mp4 for h264/aac) — never
+// a re-encode, so the clip is byte-for-byte original quality (up to 4K).
 function formatArgsFor(height) {
   const H = Math.min(2160, Math.max(144, height));
   const f = [
-    `bv*[height<=${H}][ext=mp4]+ba[ext=m4a]`,
-    `b[height<=${H}][ext=mp4]`,
-    `bv*[height<=${H}][ext=webm]+ba[ext=webm]`,
-    `b[height<=${H}][ext=webm]`,
-    `bv*[ext=mp4]+ba[ext=m4a]`,
-    `bv*[ext=webm]+ba[ext=webm]`,
-    `b`,
+    `bestvideo*[height<=${H}]+bestaudio`,
+    `best[height<=${H}]`,
+    `bestvideo*+bestaudio`,
+    `best`,
   ].join('/');
-  return ['-f', f, '--concurrent-fragments', '4'];
+  return ['-f', f, '--merge-output-format', 'webm/mp4/mkv', '--concurrent-fragments', '4'];
 }
 
 function botWallHit(text) {
@@ -398,7 +401,7 @@ function botWallHit(text) {
 }
 
 function friendlyYtError(text) {
-  if (botWallHit(text)) return 'YouTube blocked this server (bot check). Open Settings (gear icon) and paste your YouTube cookies — that fixes it in 10 seconds. (Alternative: set COOKIES or PROXY_URL env vars.)';;
+  if (botWallHit(text)) return 'YouTube blocked this server (bot check). Set the COOKIES env var (paste your cookies.txt content) or PROXY_URL, then redeploy.';;
   if (/video unavailable|private video|removed by the uploader/i.test(text)) return 'Video unavailable, private, or removed.';
   if (/members[- ]only|join this channel/i.test(text)) return 'Members-only video.';
   if (/age|sign in to confirm your age/i.test(text) && /confirm your age/i.test(text)) return 'Age-restricted video (needs cookies).';
@@ -488,6 +491,14 @@ async function jobAnalyze(job) {
   if (info.is_live) throw httpErr(422, 'Live streams cannot be clipped.');
   const heights = [...new Set((info.formats || [])
     .map((f) => f.height).filter((h) => h && h >= 100))].sort((a, b) => b - a);
+  // best combined bitrate (top video + top audio) so the UI can show real sizes
+  const bestV = (info.formats || [])
+    .filter((f) => f.height && f.height >= 100 && f.vcodec && f.vcodec !== 'none')
+    .sort((a, b) => (b.height - a.height) || ((b.tbr || 0) - (a.tbr || 0)))[0] || null;
+  const bestA = (info.formats || [])
+    .filter((f) => !f.height && f.acodec && f.acodec !== 'none')
+    .sort((a, b) => (b.tbr || 0) - (a.tbr || 0))[0] || null;
+  const tbr = Math.round(((bestV && bestV.tbr) || 0) + ((bestA && bestA.tbr) || 0));
   job.result = {
     title: info.title || 'video',
     duration: info.duration || 0,
@@ -495,6 +506,8 @@ async function jobAnalyze(job) {
     thumbnail: (info.thumbnails || []).length ? info.thumbnails[info.thumbnails.length - 1].url : '',
     heights: heights.slice(0, 12),
     max4k: heights.includes(2160),
+    height: heights[0] || 0,
+    tbr,
   };
   job.progress = 100; job.status = 'done';
 }
@@ -564,9 +577,136 @@ function probeVideo(file) {
   });
 }
 
+// ---------------------------- zip job (store-only, zero deps) ----------------
+const CRC_TABLE = (() => {
+  const t = new Int32Array(256);
+  for (let n = 0; n < 256; n++) { let c = n; for (let k = 0; k < 8; k++) c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1); t[n] = c; }
+  return t;
+})();
+function crc32Update(crc, buf) {
+  let c = (crc ^ -1) >>> 0;
+  for (let i = 0; i < buf.length; i++) c = (c >>> 8) ^ CRC_TABLE[(c ^ buf[i]) & 0xff];
+  return (c ^ -1) >>> 0;
+}
+function zipWrite(ws, buf) {
+  return new Promise((resolve, reject) => ws.write(buf, (err) => (err ? reject(err) : resolve())));
+}
+const dosTime = (d) => ({
+  time: ((d.getHours() & 31) << 11) | ((d.getMinutes() & 63) << 5) | ((Math.floor(d.getSeconds() / 2)) & 31),
+  date: (((d.getFullYear() - 1980) & 127) << 9) | (((d.getMonth() + 1) & 15) << 5) | (d.getDate() & 31),
+});
+
+// store-only ZIP (method 0, no compression): clips are already compressed, so
+// this costs ~zero CPU and streams chunk-by-chunk — RAM stays flat on 512MB.
+async function zipStore(outPath, entries, onProgress) {
+  const sizes = await Promise.all(entries.map((e) => fsp.stat(e.path).then((s) => s.size)));
+  const total = sizes.reduce((a, b) => a + b, 0) || 1;
+  const ws = fs.createWriteStream(outPath);
+  ws.on('error', () => {}); // surfaced via write/end callbacks
+  const central = [];
+  let offset = 0;
+  let written = 0;
+  try {
+    for (let i = 0; i < entries.length; i++) {
+      const e = entries[i];
+      const size = sizes[i];
+      const nameBuf = Buffer.from(e.name, 'utf8');
+      const { time, date } = dosTime(new Date());
+      let crc = 0;
+      for await (const chunk of fs.createReadStream(e.path, { highWaterMark: 1 << 20 })) crc = crc32Update(crc, chunk);
+      const lfh = Buffer.alloc(30);
+      lfh.writeUInt32LE(0x04034b50, 0);
+      lfh.writeUInt16LE(20, 4);            // version needed
+      lfh.writeUInt16LE(0x0800, 6);        // flags: UTF-8 filename
+      lfh.writeUInt16LE(0, 8);             // method: store
+      lfh.writeUInt16LE(time, 10);
+      lfh.writeUInt16LE(date, 12);
+      lfh.writeUInt32LE(crc >>> 0, 14);
+      lfh.writeUInt32LE(size, 18);
+      lfh.writeUInt32LE(size, 22);
+      lfh.writeUInt16LE(nameBuf.length, 26);
+      lfh.writeUInt16LE(0, 28);
+      await zipWrite(ws, Buffer.concat([lfh, nameBuf]));
+      for await (const chunk of fs.createReadStream(e.path, { highWaterMark: 1 << 20 })) {
+        written += chunk.length;
+        if (onProgress) onProgress(Math.min(0.999, written / total));
+        await zipWrite(ws, chunk);
+      }
+      const cdh = Buffer.alloc(46);
+      cdh.writeUInt32LE(0x02014b50, 0);
+      cdh.writeUInt16LE(20, 4);            // version made by
+      cdh.writeUInt16LE(20, 6);            // version needed
+      cdh.writeUInt16LE(0x0800, 8);
+      cdh.writeUInt16LE(0, 10);            // method: store
+      cdh.writeUInt16LE(time, 12);
+      cdh.writeUInt16LE(date, 14);
+      cdh.writeUInt32LE(crc >>> 0, 16);
+      cdh.writeUInt32LE(size, 20);
+      cdh.writeUInt32LE(size, 24);
+      cdh.writeUInt16LE(nameBuf.length, 28);
+      cdh.writeUInt16LE(0, 30);            // extra len
+      cdh.writeUInt16LE(0, 32);            // comment len
+      cdh.writeUInt16LE(0, 34);            // disk number
+      cdh.writeUInt16LE(0, 36);            // internal attrs
+      cdh.writeUInt32LE(0, 38);            // external attrs
+      cdh.writeUInt32LE(offset, 42);       // local header offset
+      central.push(Buffer.concat([cdh, nameBuf]));
+      offset += 30 + nameBuf.length + size;
+    }
+    const cdBuf = Buffer.concat(central);
+    await zipWrite(ws, cdBuf);
+    const eocd = Buffer.alloc(22);
+    eocd.writeUInt32LE(0x06054b50, 0);
+    eocd.writeUInt16LE(0, 4);
+    eocd.writeUInt16LE(0, 6);
+    eocd.writeUInt16LE(entries.length, 8);
+    eocd.writeUInt16LE(entries.length, 10);
+    eocd.writeUInt32LE(cdBuf.length, 12);
+    eocd.writeUInt32LE(offset, 16);        // central dir offset
+    eocd.writeUInt16LE(0, 20);
+    await zipWrite(ws, eocd);
+    await new Promise((resolve, reject) => ws.end((err) => (err ? reject(err) : resolve())));
+  } catch (e) {
+    try { ws.destroy(); } catch {}
+    throw e;
+  }
+}
+
+async function jobZip(job) {
+  const ids = [...new Set((Array.isArray(job._input.ids) ? job._input.ids : []).map(String))].slice(0, 24);
+  if (!ids.length) throw httpErr(400, 'Missing "ids" (clip job ids) in body');
+  const entries = [];
+  let total = 0;
+  for (const id of ids) {
+    const j = jobs.get(id);
+    if (!j || j.type !== 'clip' || j.status !== 'done' || !j.result || !j.result.file) {
+      throw httpErr(404, 'A clip is not ready or has expired — cut the clips again');
+    }
+    const st = await fsp.stat(j._file).catch(() => null);
+    if (!st || !st.isFile()) throw httpErr(404, 'A clip file has expired — cut the clips again');
+    total += st.size;
+    entries.push({ path: j._file, name: j.result.file.name });
+  }
+  if (total > 400 * 1024 * 1024) throw httpErr(413, 'Clips too large for one ZIP — download them individually');
+  const dir = path.join(CFG.workDir, job.id);
+  await fsp.mkdir(dir, { recursive: true });
+  job._dir = dir;
+  job.phase = 'zipping'; job.progress = 10;
+  const out = path.join(dir, 'clips.zip');
+  await zipStore(out, entries, (p) => { job.progress = 10 + Math.round(p * 85); });
+  const st = await fsp.stat(out);
+  job._file = out;
+  job.result = {
+    file: { name: 'opal-clips.zip', size: st.size, mime: 'application/zip', url: `/file/${job.id}` },
+    clips: entries.length,
+  };
+  job.progress = 100; job.status = 'done';
+}
+
 async function runJob(job) {
   if (job.type === 'analyze') return jobAnalyze(job);
   if (job.type === 'clip') return jobClip(job);
+  if (job.type === 'zip') return jobZip(job);
   throw httpErr(400, 'Unknown job type');
 }
 
@@ -596,6 +736,12 @@ async function startWarpTunnel(fresh) {
   const accountPath = path.join(CFG.warpDir, 'wgcf-account.toml');
   const profilePath = path.join(CFG.warpDir, 'wgcf-profile.conf');
 
+  if (fresh) {
+    // wgcf register aborts if an account file already exists (happens after an
+    // in-place restart leaves /tmp behind) — clear stale state first
+    await fsp.rm(accountPath, { force: true }).catch(() => {});
+    await fsp.rm(profilePath, { force: true }).catch(() => {});
+  }
   if (fresh || !(await fsp.stat(accountPath).catch(() => null))) {
     // register a brand-new WARP identity (free, no signup)
     await run('wgcf', ['register', '--accept-tos'], CFG.warpDir, 40 * 1000);
@@ -831,7 +977,7 @@ const server = http.createServer(async (req, res) => {
         jobs: { running: runningCount, queued: queue.length },
         warp: { enabled: CFG.warp, active: !!state.connectProxyUrl, error: state.warpError.slice(0, 140) },
         cookies: !!state.cookiesFile,
-        ytdlp: state.ytdlpVersion || '', version: '2.1.0',
+        ytdlp: state.ytdlpVersion || '', version: '2.2.0',
       });
     }
     if (req.method === 'GET' && (p === '/' || p === '/index.html')) return serveAsset(req, res);
@@ -840,7 +986,7 @@ const server = http.createServer(async (req, res) => {
       return sendJson(res, 200, {
         maxClipSeconds: CFG.maxClipSeconds,
         authRequired: !!CFG.apiKey,
-        version: '2.1.0',
+        version: '2.2.0',
       });
     }
 
@@ -901,6 +1047,15 @@ const server = http.createServer(async (req, res) => {
         return sendJson(res, 202, { jobId: job.id, status: job.status });
       }
 
+      if (p === '/api/zip' && req.method === 'POST') {
+        const body = await readJsonBody(req);
+        if (!Array.isArray(body.ids) || !body.ids.length) throw httpErr(400, 'Missing "ids" array (clip job ids) in body');
+        if (body.ids.length > 24) throw httpErr(400, 'Too many clips for one ZIP (max 24)');
+        if (queue.length + runningCount >= CFG.maxQueue) throw httpErr(429, 'Server busy — try again shortly');
+        const job = newJob('zip', { ids: body.ids.map((x) => String(x)) });
+        return sendJson(res, 202, { jobId: job.id, status: job.status });
+      }
+
       const mJob = p.match(/^\/api\/job\/([a-z0-9]+)$/i);
       if (mJob) {
         const job = jobs.get(mJob[1]);
@@ -914,10 +1069,10 @@ const server = http.createServer(async (req, res) => {
     }
 
     const mFile = p.match(/^\/file\/([a-z0-9]+)$/i);
-    if (mFile && req.method === 'GET') {
+    if (mFile && (req.method === 'GET' || req.method === 'HEAD')) {
       if (!authOk(req)) throw httpErr(401, 'Invalid or missing X-Api-Key header');
       const job = jobs.get(mFile[1]);
-      if (!job || job.type !== 'clip') throw httpErr(404, 'File not found (job may have expired)');
+      if (!job || (job.type !== 'clip' && job.type !== 'zip')) throw httpErr(404, 'File not found (job may have expired)');
       if (job.status !== 'done' || !job.result || !job.result.file) throw httpErr(409, `Job is ${job.status} — file not ready`);
       return serveFile(req, res, job);
     }
@@ -937,6 +1092,9 @@ function serveFile(req, res, job) {
   fs.stat(filePath, (err, st) => {
     if (err || !st.isFile()) return sendJson(res, 404, { error: 'File missing (expired)' });
     const size = st.size;
+    // keep the file alive while it is actively downloaded / previewed
+    job.lastAccess = Date.now();
+    fsp.utimes(filePath, new Date(), new Date()).catch(() => {});
     const range = String(req.headers.range || '');
     const headersBase = {
       'Content-Type': f.mime,
@@ -955,17 +1113,19 @@ function serveFile(req, res, job) {
         res.writeHead(416, { 'Content-Range': `bytes */${size}` });
         return res.end();
       }
-      const stream = fs.createReadStream(filePath, { start, end });
       res.writeHead(206, {
         ...headersBase,
         'Content-Range': `bytes ${start}-${end}/${size}`,
         'Content-Length': end - start + 1,
       });
+      if (req.method === 'HEAD') return res.end();
+      const stream = fs.createReadStream(filePath, { start, end });
       stream.pipe(res);
       stream.on('error', () => { try { res.destroy(); } catch {} });
     } else {
-      const stream = fs.createReadStream(filePath);
       res.writeHead(200, { ...headersBase, 'Content-Length': size });
+      if (req.method === 'HEAD') return res.end();
+      const stream = fs.createReadStream(filePath);
       stream.pipe(res);
       stream.on('error', () => { try { res.destroy(); } catch {} });
     }
