@@ -2,7 +2,8 @@
 'use strict';
 /* ============================================================================
    Opal Clip Cloud — zero-dependency YouTube clipper built for Render free tier
-   Target: 512MB RAM | 24x7 (self-ping) | up to 4K | stream-copy (NO re-encode)
+   Target: 512MB RAM | 24x7 (self-ping) | up to 4K | frame-exact re-encode at
+   download time (audio-only tracks stay remuxed — no video = no GOP problem)
    ============================================================================ */
 
 const http = require('http');
@@ -45,6 +46,13 @@ const CFG = {
   analyzeCacheTtlMs: Math.max(10, +(process.env.ANALYZE_TTL_MIN || 720)) * 60 * 1000,
   clipCacheTtlMs: Math.max(10, +(process.env.CLIP_TTL_MIN || 360)) * 60 * 1000,
   clipCacheMaxBytes: Math.max(0, +(process.env.CLIP_CACHE_MB || 300)) * 1024 * 1024,
+  // --- download-time render (frame-exact re-encode) ---
+  ffmpegPath: process.env.FFMPEG_PATH || 'ffmpeg',
+  prerollSec: Math.max(0, +(process.env.PREROLL_SEC || 15)),
+  encodePreset: (process.env.ENCODE_PRESET || '').trim(),  // override the auto ladder
+  encodeCrf: Math.max(0, parseInt(process.env.ENCODE_CRF, 10) || 0),
+  encodeThreads: Math.max(0, parseInt(process.env.ENCODE_THREADS, 10) || 0),
+  encodeTimeoutMs: Math.max(5, +(process.env.ENCODE_TIMEOUT_MIN || 50)) * 60 * 1000,
 };
 
 const state = {
@@ -584,12 +592,11 @@ function ytBaseArgs() {
   return args;
 }
 
-// format chain: ALWAYS the ORIGINAL quality — best video + best audio ranked
-// purely by quality. The old container-first chain could silently cap quality
-// (e.g. 4K VP9-only videos falling back to a 1080p MP4). yt-dlp merges with a
-// pure stream-copy remux; --merge-output-format lets it pick the first container
-// that can hold both streams (webm for vp9/av01+opus, mp4 for h264/aac) — never
-// a re-encode, so the clip is byte-for-byte original quality (up to 4K).
+// format chain for the SECTION download: best video + best audio ranked purely
+// by quality at the chosen cap. This intermediate is stream-copy (fast, ~0 CPU);
+// the frame-exact render happens afterwards in runFfmpegEncode(). The old
+// container-first chain could silently cap quality (e.g. 4K VP9-only videos
+// falling back to a 1080p MP4), so the ranking stays pure-quality.
 function formatArgsFor(height) {
   const H = Math.min(2160, Math.max(144, height));
   const f = [
@@ -728,13 +735,88 @@ async function jobAnalyze(job) {
   await analyzeCacheSet(akey, job.result);
 }
 
+// ---------------------------- ffmpeg encode (frame-exact render) ------------
+// WHY THIS EXISTS: a pure stream-copy cut starts mid-GOP — its first video
+// frames are P/B-frames that reference frames which were never downloaded, so
+// every player shows a FROZEN picture (audio keeps playing) for the first
+// seconds until the next keyframe arrives. Re-encoding fixes it for good:
+//   * frame #1 of the output is a fresh IDR keyframe -> decodes instantly
+//   * input-side -ss + re-encode = accurate seek -> the clip starts on the
+//     EXACT requested frame (not the previous keyframe)
+//   * audio is re-encoded to AAC -> priming-sample drift / desync disappears
+//   * -movflags +faststart -> moov atom at the front -> playback starts at once
+// x264 ladder tuned for the free tier (0.1 CPU / 512MB); override per deploy
+// with ENCODE_PRESET / ENCODE_CRF / ENCODE_THREADS if you need to retune.
+function encodeSettings(h, attempt) {
+  const H = +h || 720;
+  let preset = CFG.encodePreset || (H > 1440 ? 'ultrafast' : H > 1080 ? 'superfast' : 'veryfast');
+  let crf = CFG.encodeCrf || (H > 1440 ? 19 : 18);
+  let threads = CFG.encodeThreads || (H > 1080 ? 2 : 0);
+  if (attempt > 0) { preset = 'ultrafast'; threads = 1; } // memory-safe retry
+  return { preset, crf, threads };
+}
+
+function encodeArgs(src, out, trimStart, want, meta, title, attempt) {
+  const { preset, crf, threads } = encodeSettings(meta.height, attempt);
+  const fps = meta.fps > 0 ? meta.fps : 30;
+  const g = Math.max(24, Math.min(120, Math.round(fps * 2))); // ~2s GOP: smooth scrubbing
+  return [
+    '-y', '-hide_banner', '-nostdin', '-loglevel', 'error', '-stats',
+    '-ss', trimStart.toFixed(3), '-i', src, '-t', want.toFixed(3),
+    '-map', '0:v:0', '-map', '0:a:0?',
+    '-c:v', 'libx264', '-preset', preset, '-crf', String(crf),
+    '-pix_fmt', 'yuv420p', '-g', String(g),
+    ...(threads ? ['-threads', String(threads)] : []),
+    '-c:a', 'aac', '-b:a', ((meta.height || 0) >= 1080 ? '160k' : '128k'),
+    '-movflags', '+faststart', '-avoid_negative_ts', 'make_zero',
+    '-metadata', `title=${title}`,
+    out,
+  ];
+}
+
+// run ffmpeg on LOCAL files (no proxy env — it never touches the network).
+// Progress comes from the `time=` stats line so the UI's live
+// "rendering 480p · 47%" keeps moving through the encode phase. The child is
+// registered in childByJob so DELETE /api/job/:id (cancel) kills the encoder.
+function runFfmpegEncode(args, job, { from, to, want }) {
+  return new Promise((resolve) => {
+    const child = spawn(CFG.ffmpegPath, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+    let err = '';
+    child.stderr.on('data', (d) => {
+      const t = d.toString();
+      err = (err + t).slice(-6000);
+      if (job && want > 0) {
+        const m = t.match(/time=(\d+):(\d+):(\d+(?:\.\d+)?)/);
+        if (m) {
+          const sec = (+m[1]) * 3600 + (+m[2]) * 60 + (+m[3]);
+          const pct = from + Math.min(0.999, sec / want) * (to - from);
+          if (pct > job.progress) { job.progress = pct; job.phase = 'encoding'; }
+        }
+      }
+      if (job) {
+        for (const line of t.split('\n')) if (line.trim() && /error|invalid|corrupt|fail/i.test(line)) jobLog(job, line.slice(0, 200));
+      }
+    });
+    child.on('error', (e) => resolve({ code: 1, err: String((e && e.message) || e) }));
+    child.on('close', (code) => resolve({ code: code === null ? 1 : code, err }));
+    if (job) childByJob.set(job.id, child);
+    const t = setTimeout(() => { try { child.kill('SIGKILL'); } catch {} }, CFG.encodeTimeoutMs);
+    child.on('close', () => { clearTimeout(t); if (job) childByJob.delete(job.id); });
+  });
+}
+
 // ---------------------------- clip job ---------------------------------------
+// Download-time render pipeline (v2.6):
+//   1. yt-dlp fetches ONLY the needed section (fast stream-copy download) with
+//      a short PREROLL so frames BEFORE the cut exist for the encoder
+//   2. the section is re-encoded (H.264 + AAC, faststart MP4) trimmed to the
+//      EXACT requested timestamp — frame #1 is a clean IDR keyframe, so the
+//      downloaded clip plays immediately (no frozen video at the start)
 async function jobClip(job) {
   const { url, start, end, height } = job._input;
-  // clip cache: an identical cut (same video + range + format) replays instantly
-  // with zero re-download — this is what keeps load flat when users retry or
-  // re-cut the same segments
-  const ckey = `${videoKeyOf(url)}|${(+start).toFixed(2)}|${(+end).toFixed(2)}|${height}`;
+  // cache key carries the pipeline version: finished renders replay instantly,
+  // but old stream-copy entries (frozen first GOP) are never reused
+  const ckey = `${videoKeyOf(url)}|${(+start).toFixed(2)}|${(+end).toFixed(2)}|${height}|re1`;
   const cached = await clipCacheGet(ckey);
   if (cached) {
     job.result = {
@@ -751,64 +833,136 @@ async function jobClip(job) {
   const dir = path.join(CFG.workDir, job.id);
   await fsp.mkdir(dir, { recursive: true });
   job._dir = dir;
+  const audioOnly = height === 'audio';
   job.phase = 'downloading'; job.progress = 1;
 
+  // exact clip length; video sections pull a preroll so the re-encoder can
+  // start decoding BEFORE the cut and land on the exact first frame
+  const want = end - start;
+  const secStart = audioOnly ? start : Math.max(0, start - CFG.prerollSec);
   const outTpl = path.join(dir, 'clip.%(ext)s');
-  const audioOnly = height === 'audio';
   const args = [
     ...ytBaseArgs(),
-    '--download-sections', `*${start}-${end}`,
-    // NOTE: no --force-keyframes-at-cuts — cuts stay keyframe-aligned so the
-    // section download + merge are a pure stream-copy (fast, ~0 RAM overhead)
+    '--download-sections', `*${secStart.toFixed(2)}-${end.toFixed(2)}`,
     ...(audioOnly
       ? ['-f', 'bestaudio/best', '--concurrent-fragments', '4'] // original audio stream, remux only
       : formatArgsFor(height === 'auto' ? 2160 : height)),
     '-o', outTpl,
     url,
   ];
-  const res = await runYt(args, job, 90);
+  const res = await runYt(args, job, audioOnly ? 90 : 65);
   const combined = res.stdout + res.stderr;
   if (res.code !== 0) throw httpErr(422, friendlyYtError(combined || `yt-dlp exited ${res.code}`));
 
-  job.progress = 92; job.phase = 'finalizing';
   const files = (await fsp.readdir(dir)).filter((f) => f.startsWith('clip.'));
   if (!files.length) throw httpErr(422, 'Download finished but no output file was produced.');
-  const file = path.join(dir, files[0]);
-  const st = await fsp.stat(file);
-  if (st.size < 1024) throw httpErr(422, 'Output file is empty.');
-  job._file = file;
-  job._dir = dir;
+  const src = path.join(dir, files[0]);
+  const st0 = await fsp.stat(src);
+  if (st0.size < 1024) throw httpErr(422, 'Output file is empty.');
+  job._file = src;
 
-  job.progress = 96; job.phase = 'probing';
-  const meta = await probeVideo(file);
-  const ext = path.extname(file).slice(1).toLowerCase();
-  const AUDIO_MIME = { m4a: 'audio/mp4', mp3: 'audio/mpeg', opus: 'audio/ogg', ogg: 'audio/ogg', webm: 'audio/webm', wav: 'audio/wav', aac: 'audio/aac', flac: 'audio/flac' };
-  const mime = audioOnly
-    ? (AUDIO_MIME[ext] || 'application/octet-stream')
-    : (ext === 'webm' ? 'video/webm' : (ext === 'mkv' ? 'video/x-matroska' : 'video/mp4'));
-  const name = audioOnly
-    ? `${sanitizeFilename(job.title || 'clip')} audio ${humanRange(start, end)}.${ext}`
-    : `${sanitizeFilename(job.title || 'clip')} ${meta.height ? meta.height + 'p ' : ''}${humanRange(start, end)}.${ext === 'mkv' ? 'mkv' : ext}`;
+  job.progress = audioOnly ? 92 : 68; job.phase = 'probing';
+  const meta = await probeVideo(src);
+  const ext = path.extname(src).slice(1).toLowerCase();
 
+  // ---- remux path: audio-only (no video frames = no keyframe problem) or a
+  // source with no video stream — serve yt-dlp's output as-is (original track)
+  if (audioOnly || !meta.height) {
+    const AUDIO_MIME = { m4a: 'audio/mp4', mp3: 'audio/mpeg', opus: 'audio/ogg', ogg: 'audio/ogg', webm: 'audio/webm', wav: 'audio/wav', aac: 'audio/aac', flac: 'audio/flac' };
+    const mime = audioOnly
+      ? (AUDIO_MIME[ext] || 'application/octet-stream')
+      : (ext === 'webm' ? 'video/webm' : (ext === 'mkv' ? 'video/x-matroska' : 'video/mp4'));
+    const name = audioOnly
+      ? `${sanitizeFilename(job.title || 'clip')} audio ${humanRange(start, end)}.${ext}`
+      : `${sanitizeFilename(job.title || 'clip')} ${meta.height ? meta.height + 'p ' : ''}${humanRange(start, end)}.${ext === 'mkv' ? 'mkv' : ext}`;
+    job.result = {
+      file: { name, size: st0.size, mime, url: `/file/${job.id}` },
+      video: { height: meta.height, width: meta.width, codec: meta.codec, duration: meta.duration, ext },
+      clipped: { start, end },
+      render: { mode: 'remux' },
+    };
+    job.progress = 100; job.status = 'done';
+    const moved = await clipCachePersist(ckey, src, ext, name, st0.size, mime, job.result.video, job.result.clipped);
+    if (moved) job._file = moved;
+    return;
+  }
+
+  // ---- map the requested timestamp onto the section file's own timeline ----
+  // yt-dlp cuts sections packet-exactly; depending on container the file either
+  // KEEPS the original content timestamps (first video pts > 0.5 -> file time
+  // == content time, seek directly) or is REBASED to zero (recover the exact
+  // offset from duration slack: preroll + actualSpan - requestedSpan).
+  const p0 = await probeFirstVideoPts(src);
+  let trimStart;
+  if (isFinite(p0) && p0 > 0.5) {
+    trimStart = start;
+    jobLog(job, `section keeps content timestamps (first pts ${p0.toFixed(2)}s) -> exact seek ${start.toFixed(2)}s`);
+  } else {
+    const requested = end - secStart;
+    const slack = Math.max(0, (meta.duration || 0) - requested);
+    trimStart = Math.min(Math.max(0, (start - secStart) + slack),
+                         Math.max(0, (meta.duration || 0) - want - 0.05));
+    jobLog(job, `section rebased to zero (dur ${meta.duration || 0}s, slack ${slack.toFixed(2)}s) -> trim at ${trimStart.toFixed(2)}s`);
+  }
+
+  // ---- re-encode: frame #1 = clean IDR at the exact timestamp ----
+  const out = path.join(dir, 'clip.mp4');
+  const title = sanitizeFilename(job.title || 'clip');
+  const ladder = encodeSettings(meta.height, 0);
+  const renderInfo = {
+    mode: 'encode',
+    timeline: (isFinite(p0) && p0 > 0.5) ? 'content' : 'rebased',
+    firstPts: isFinite(p0) ? Math.round(p0 * 100) / 100 : null,
+    trimStart: Math.round(trimStart * 100) / 100,
+    want: Math.round(want * 100) / 100,
+    preset: ladder.preset, crf: ladder.crf,
+  };
+  job.phase = 'encoding';
+  const enc1 = await runFfmpegEncode(encodeArgs(src, out, trimStart, want, meta, title, 0), job, { from: 70, to: 96, want });
+  if (enc1.code !== 0) {
+    jobLog(job, `encode attempt 1 failed (code ${enc1.code}) — retrying with low-memory settings`);
+    job.phase = 'encoding (low memory)';
+    const enc2 = await runFfmpegEncode(encodeArgs(src, out, trimStart, want, meta, title, 1), job, { from: 70, to: 96, want });
+    if (enc2.code !== 0) {
+      const why = (enc2.err || '').split('\n').map((l) => l.trim()).filter(Boolean).slice(-2).join(' ').slice(0, 180);
+      throw httpErr(422, `Rendering failed — ${why || `ffmpeg exited ${enc2.code}`}`);
+    }
+  }
+  const st1 = await fsp.stat(out).catch(() => null);
+  if (!st1 || st1.size < 1024) throw httpErr(422, 'Rendering produced an empty file.');
+
+  job.progress = 97; job.phase = 'finalizing';
+  const om = await probeVideo(out);
+  if (!om.duration || Math.abs(om.duration - want) > 1.2) {
+    jobLog(job, `duration note: wanted ${want.toFixed(1)}s, got ${om.duration || 0}s`);
+  }
+  await fsp.rm(src, { force: true }).catch(() => {}); // drop the raw section — halves disk usage
+  job._file = out;
+
+  const name = `${title} ${meta.height ? meta.height + 'p ' : ''}${humanRange(start, end)}.mp4`;
   job.result = {
-    file: { name, size: st.size, mime, url: `/file/${job.id}` },
-    video: { height: meta.height, width: meta.width, codec: meta.codec, duration: meta.duration, ext },
+    file: { name, size: st1.size, mime: 'video/mp4', url: `/file/${job.id}` },
+    video: { height: om.height || meta.height, width: om.width || meta.width, codec: om.codec || 'h264', duration: om.duration, ext: 'mp4' },
     clipped: { start, end },
+    render: renderInfo,
   };
   job.progress = 100; job.status = 'done';
+  const moved = await clipCachePersist(ckey, out, 'mp4', name, st1.size, 'video/mp4', job.result.video, job.result.clipped);
+  if (moved) job._file = moved;
+}
 
-  // persist into the clip cache: MOVE the finished file into cache/clips/ so the
-  // next request for the same cut is served straight from disk (best-effort)
+// move a finished clip into the shared disk cache (best-effort). Returns the
+// new path when the file was moved, or null when caching failed.
+async function clipCachePersist(ckey, file, ext, name, size, mime, video, clipped) {
   try {
     const cachePath = path.join(clipCacheDir, `${hashKey(ckey)}.${ext}`);
     await fsp.mkdir(clipCacheDir, { recursive: true });
     await fsp.rename(file, cachePath);
-    job._file = cachePath;
-    const rec = { path: cachePath, name, size: st.size, mime, video: job.result.video, clipped: job.result.clipped, at: Date.now() };
+    const rec = { path: cachePath, name, size, mime, video, clipped, at: Date.now() };
     clipCache.set(ckey, rec);
     await fsp.writeFile(path.join(clipCacheDir, `${hashKey(ckey)}.json`), JSON.stringify(rec)).catch(() => {});
-    jobLog(job, 'cached for instant replay');
-  } catch { /* cache is best-effort — the clip itself already succeeded */ }
+    return cachePath;
+  } catch { return null; }
 }
 
 function probeVideo(file) {
@@ -821,12 +975,30 @@ function probeVideo(file) {
       try {
         const j = JSON.parse(out);
         const v = (j.streams || []).find((s) => s.codec_type === 'video') || {};
+        const rf = String(v.r_frame_rate || '').match(/^(\d+)\s*\/\s*(\d+)$/);
         resolve({
           height: v.height || 0, width: v.width || 0,
           codec: v.codec_name || '',
-          duration: Math.round(parseFloat((j.format || {}).duration || v.duration || 0) * 10) / 10,
+          duration: Math.round(parseFloat((j.format || {}).duration || v.duration || 0) * 100) / 100,
+          fps: (rf && +rf[2] > 0) ? (+rf[1] / +rf[2]) : 0,
         });
       } catch { resolve({}); }
+    });
+  });
+}
+
+// first video packet pts — reveals whether the section file keeps the original
+// content timestamps (pts > 0.5) or was rebased to zero (pts ~ 0)
+function probeFirstVideoPts(file) {
+  return new Promise((resolve) => {
+    const p = spawn(CFG.ffprobePath, ['-v', 'error', '-select_streams', 'v:0',
+      '-read_intervals', '%+#1', '-show_entries', 'packet=pts_time', '-of', 'csv=p=0', file]);
+    let out = '';
+    p.stdout.on('data', (d) => { out += d.toString(); });
+    p.on('error', () => resolve(NaN));
+    p.on('close', () => {
+      const m = out.trim().match(/^(\d+(?:\.\d+)?)/);
+      resolve(m ? parseFloat(m[1]) : NaN);
     });
   });
 }
@@ -1231,7 +1403,7 @@ const server = http.createServer(async (req, res) => {
         jobs: { running: runningCount, queued: queue.length },
         warp: { enabled: CFG.warp, active: !!state.connectProxyUrl, error: state.warpError.slice(0, 140) },
         cookies: !!state.cookiesFile,
-        ytdlp: state.ytdlpVersion || '', version: '2.5.0',
+        ytdlp: state.ytdlpVersion || '', version: '2.6.0',
         caches: {
           analyze: analyzeCache.size,
           clips: clipCache.size,
@@ -1246,7 +1418,7 @@ const server = http.createServer(async (req, res) => {
       return sendJson(res, 200, {
         maxClipSeconds: CFG.maxClipSeconds,
         authRequired: !!CFG.apiKey,
-        version: '2.5.0',
+        version: '2.6.0',
       });
     }
 

@@ -214,7 +214,7 @@ function startClipRender(i,q){
      c.f=f.url||'';c.z=+f.size||0;c.rd=+v.duration||0;c.h=+v.height||0;c.audio=q==='audio';c.rqH=q;break}
     if(j.status==='error'||j.status==='cancelled')throw new Error(j.error||'Render failed');
     R.p=Math.max(R.p,Math.min(99,Math.round(+j.progress||0)));cardUI(i);
-    if(Date.now()-t0>600000)throw new Error('Render timed out — try a shorter clip')}
+    if(Date.now()-t0>900000)throw new Error('Render timed out — try a shorter clip or a lower quality')}
   }catch(e){R.err=String(e.message||'Render failed');
    if(R.id&&!/cancel/i.test(R.err))fetch('/api/job/'+R.id,{method:'DELETE'}).catch(()=>{})}
   delete S.rend[i];cardUI(i);
