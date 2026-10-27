@@ -49,19 +49,21 @@ Verify health: `GET /healthz` → `{"ok":true,"warp":{"active":true},...}`
 | `CLIP_TTL_MIN` | `360` | How long finished clip files stay cached for instant replay. |
 | `CLIP_CACHE_MB` | `300` | Total disk budget for cached clips (LRU eviction when exceeded). |
 | `PREROLL_SEC` | `4` | Extra seconds downloaded *before* your start timestamp — gives the encoder reference frames so the first rendered frame is exactly yours. |
-| `MAX_RENDER_H` | `1080` | Height cap for renders. Above 1080p the free tier's 0.1 CPU makes re-encodes hopeless-slow and 512MB makes them OOM, so pixels above the cap are never even fetched. Raise it (e.g. `2160`) on a paid instance. |
+| `MAX_RENDER_H` | `2160` | Height cap for renders (v2.8: **source max by default — 4K works**). The chunked encoder keeps >1080p RAM-bounded and always-moving progress. Clamp to `1080` only on deliberately tiny instances. |
 | `YT_TIMEOUT_MIN` | `15` | Hard cap on one yt-dlp section download — a hung download must not jam the 1-slot queue. |
 | `ENCODE_PRESET` | `ultrafast` | Override the x264 preset (`superfast`, `veryfast`, …). `ultrafast` is 3-5x faster than `veryfast` on the throttled CPU. |
-| `ENCODE_CRF` | `23` | Override the quality. Lower = better/bigger. 23 is visually clean on a phone. |
-| `ENCODE_THREADS` | auto | Cap encoder threads (auto: the **real cgroup CPU quota**, 1-4 — prevents thread thrash on the shared CPU). |
-| `ENCODE_TIMEOUT_MIN` | `16` | Hard cap on a single render (matches the UI's 15-min wait). |
+| `ENCODE_CRF` | `21` (≤1080p) / `20` (≥1440p) | Override the quality. Lower = better/bigger. v2.8 dropped one CRF step for visibly better output. |
+| `ENCODE_THREADS` | auto | Cap encoder threads (auto: the **real cgroup CPU quota**, 1-4; ≥1440p clamps to 2 to stay clear of the 512MB OOM line). |
+| `ENCODE_TIMEOUT_MIN` | `16` | Base render budget for ≤1080p; 1440p ×1.75 and 4K ×2.5 automatically (the UI wait scales the same way). |
+| `CHUNK_SEC` | `10` | **Chunk system**: >1080p (or >90s) renders are encoded in pieces of this length and joined — bounded RAM, per-chunk retry, progress that never looks stuck. |
+| `STALL_SEC` | `90` | A download/encoder that goes silent this long is wedged → killed and retried automatically. |
 | `FFMPEG_PATH` | `ffmpeg` | ffmpeg binary path. |
 
 ## API
 
 ```
-GET  /healthz               → {"ok":true,"ramMB":...,"warp":{...},"caches":{...},"version":"2.7.0"}
-GET  /api/capabilities      → {"maxClipSeconds":600,"authRequired":false}
+GET  /healthz               → {"ok":true,"ramMB":...,"warp":{...},"caches":{...},"version":"2.8.0"}
+GET  /api/capabilities      → {"maxClipSeconds":600,"authRequired":false,"maxHeight":2160,"chunkedRender":true}
 GET  /api/thumb/:videoId    → YouTube thumbnail JPEG (proxied, cached 24h in the browser)
 POST /api/analyze {url}                      → {"jobId":"…"}
      result: {title,duration,uploader,height,tbr,heights[],max4k,thumbnail,id}
@@ -69,7 +71,7 @@ POST /api/analyze {url}                      → {"jobId":"…"}
 POST /api/clip {url,start,end,title,quality} → {"jobId":"…"}
      start/end: seconds ("90") or "1:30" / "1:02:03"
      quality: omit (or "auto") = best video+audio (recommended), or a height like 480/1080/2160, or "audio"
-     result: {file:{name,size,mime,url},video:{height,width,codec,ext,duration},clipped:{start,end},render:{mode,timeline,trimStart,want,preset,crf},cached?}
+     result: {file:{name,size,mime,url},video:{height,width,codec,ext,duration},clipped:{start,end},render:{mode,timeline,trimStart,want,preset,crf,chunks?},cached?}
      video.duration is the REAL probed length of the produced clip (frame-exact ≈ your requested range)
 POST /api/zip {ids:[clipJobId,…]}           → {"jobId":"…"}  (store-mode ZIP, ≤24 clips)
 GET  /api/job/:id           → {status,progress,phase,result|error}
@@ -86,9 +88,9 @@ All POST + `/file` routes require `X-Api-Key` when `API_KEY` env is set. `/api/t
 - Node server idle: **~45MB**
 - wireproxy (WARP): **~35MB**
 - yt-dlp mid-download: **~40MB**
-- ffmpeg render: **`ultrafast` + 1-4 threads + ≤1080p cap** keeps the encode around ~150-250MB peak — comfortably inside 512MB with the section download and tunnel also resident. A retry at 1 thread fires automatically if a pass still dies.
+- ffmpeg render: **≤1080p**: `ultrafast` + 1-4 threads ≈ 150-250MB peak. **≥1440p (chunked)**: threads clamp to 2 and the encode runs in 10s pieces — RAM stays bounded regardless of clip length; a per-chunk retry at 1 thread fires automatically if a pass still dies.
 
-> **Free-tier CPU note:** Render free instances are CPU-throttled, so renders are slower there than on a full machine — v2.7's speed-first settings (`ultrafast`, cgroup-aware threads, 4s preroll, ≤1080p fetch cap, H.264-preferred source) cut the wall time several-fold vs v2.6; a ~30s clip at 360-1080p typically lands well under a couple of minutes even on the throttled CPU, and shorter/lower-quality clips are faster still. Job progress is live in the UI the whole time, clips are cached afterwards, and short clips are the sweet spot.
+> **Free-tier CPU note:** Render free instances are CPU-throttled, so renders are slower there than on a full machine. v2.8 restores **full quality up to 4K**: a 360-1080p clip still lands in minutes (ultrafast, cgroup-aware threads, 4s preroll, H.264-preferred source), while a **4K render is a deliberate WAIT** — the chunked encoder keeps progress visibly moving chunk-by-chunk ("encoding 2160p · chunk 3/5"), the card shows a **cancel** link at all times, repeat downloads replay instantly from cache, and the render budget scales with resolution (16/28/40 min). If you mostly cut long 4K clips on the free tier, expect real patience — quality is never silently downgraded to save time.
 
 Disk: files live in `/tmp/opal` (ephemeral); finished jobs auto-delete after 20 min, while the **cache tree** (`/tmp/opal/cache`) holds thumbnails, analysis results and up to `CLIP_CACHE_MB` of popular clips for up to their TTLs. Nothing sensitive persists.
 
@@ -103,10 +105,11 @@ render.yaml        — Render blueprint
 
 ## Notes & limits
 
-- **Frame-exact renders (no more frozen starts):** every video clip is **re-encoded at download time** — H.264 + AAC in an MP4 with `+faststart`. Frame #1 is a clean IDR keyframe at your exact timestamp (a ~4s preroll is downloaded just to give the encoder reference frames), the duration matches your requested range to ~0.1s, and playback starts instantly. Output size depends on CRF (default 23).
+- **Frame-exact renders up to 4K (no more frozen starts):** every video clip is **re-encoded at download time** — H.264 + AAC in an MP4 with `+faststart`. Frame #1 is a clean IDR keyframe at your exact timestamp (a ~4s preroll is downloaded just to give the encoder reference frames), the duration matches your requested range to ~0.1s, and playback starts instantly. Output quality: CRF 21 (≤1080p) / 20 (≥1440p); heights render at their **real value up to the source max (2160)** — nothing is silently capped.
 - **Audio-only (`MP3` chip):** the **original audio track** is served remuxed (`.m4a`/`.opus`) — no video frames means no keyframe problem, so no re-encode is wasted on it.
 - **Instant cut, lazy render:** the **Cut clips** step does no work at all — cards appear immediately with a **360p YouTube embed starting at your exact timestamp** (`start`/`end` pinned to your range). The actual download/render happens **only when you click Download**: the clip is fetched from the same timestamp at the chosen quality, with a live progress bar inside the card. Leaving the clips view cancels pending renders; the ZIP button renders all needed clips first ("Rendering 2/5…"), then streams them as one store-mode ZIP. Repeat downloads of the same range+quality replay instantly from the clip cache.
-- Very long clips (near the 10-min cap) still take real time to render on the free tier — the job runs asynchronously with live progress, so long jobs are fine, but short clips are the sweet spot.
+- **Chunk system (v2.8):** big renders (>1080p, or clips longer than ~90s) are fetched and encoded **in chunks** — the section downloads with 6 concurrent fragments + 10MB HTTP range chunks + a stall watchdog (a wedged connection is killed and the exact section re-fetched automatically), and the encode runs in 10s video-only pieces that are joined with frame-exact durations (audio is encoded once for the whole range, so chunk joins are seamless). Progress always moves; a failed chunk retries alone.
+- Very long clips (near the 10-min cap) still take real time to render on the free tier — the job runs asynchronously with live progress and a cancel link, so long jobs are fine, but short clips are the sweet spot.
 - Files auto-delete after 20 idle minutes; an active download keeps its file alive.
 - Use responsibly and respect content creators' rights and site terms.
 
@@ -122,6 +125,7 @@ MIT
 - After redeploying, **hard-refresh** the browser (Ctrl+Shift+R) — the old HTML can be cached for up to 5 minutes.
 
 **Version history**
+- **2.8** — **quality-first: 4K restored + the chunk system** (the "I want MAX quality from my exact timestamp, never stuck" release): the **1080p cap is gone** — `MAX_RENDER_H` defaults to the source max (2160), so 1440p/4K requests fetch and render at their real height with CRF dropped a step (21/20) and richer audio (up to 192k AAC); **chunked section download** (6 concurrent fragments + `--http-chunk-size 10M` + socket timeout 25s + retries 8) with a **stall watchdog** (a download that goes silent for `STALL_SEC` is SIGKILLed and the exact section re-fetched — wedged connections can never hang a job) and an encoder stall watchdog on top; **chunked encode for big renders** (>1080p or >90s): the video is encoded in `CHUNK_SEC`-second video-only pieces with identical codec params, joined via the concat demuxer with pinned exact per-chunk durations, audio encoded once for the whole range and muxed at the end (seamless joins, no AAC priming clicks) — per-chunk retry at 1 thread, bounded RAM at 4K, always-moving "encoding 2160p · chunk 3/5" progress, and any chunked failure falls back to the proven single-pass encoder behind the same hard validation gate; render budgets scale with resolution (16/28/40 min) and the UI wait matches, with a **cancel link on every rendering card**; cache keys versioned `re3`.
 - **2.7** — **speed-first renders + empty-file-proof pipeline** (fixes "render is very slow" and "render produced an empty file" on Render's free tier): encoder switched to **`ultrafast` + CRF 23** for every resolution (veryfast measured minutes per short clip on the 0.1 shared CPU; ultrafast is 3-5x faster and its near-zero lookahead keeps RAM far from the OOM line), **threads now follow the real cgroup CPU quota** (1-4 — x264 no longer spawns a thread per visible host core and thrashes the quota), **preroll cut 15s → 4s** (less to download and decode before your first frame), **`MAX_RENDER_H` (default 1080) cap** — >1080p re-encodes were hopeless-slow and an OOM risk on 512MB, so pixels above the cap are never fetched and H.264 source formats are preferred over VP9/AV1 for 2-4x faster decode; the clip card honestly shows the real rendered height. The section→output **timeline mapping became a candidate ladder with a hard validation gate** (real duration + video stream + ≥25KB) — a wrong guess falls through to the next candidate (content → rebased → raw-offset → from-zero safe), so a render can never again exit 0 with a header-only MP4 (the "empty file" bug) or serve a truncated clip; video-less downloads now fail loudly instead of falling back to a frozen stream-copy remux; `/file` refuses <1KB outputs; yt-dlp/ffmpeg hard timeouts tightened (15/16 min) so one hung job can't jam the single worker slot; cache keys versioned `re2`.
 - **2.6** — **no more frozen video at the start of downloaded clips** (the "video stuck 5–10s while audio plays" bug): clips are now **re-encoded at download time** instead of stream-copied — a stream-copy cut started mid-GOP, so the first frames referenced frames that were never downloaded and players froze until the next keyframe. The render is **frame-exact**: a preroll (`PREROLL_SEC`) is downloaded for reference frames, the section's timeline is probed (content-timestamps vs rebased), ffmpeg seeks to your exact frame and emits a fresh IDR keyframe + AAC audio + `+faststart` MP4. Preset ladder for the 512MB free tier (`ENCODE_PRESET`/`ENCODE_CRF`/`ENCODE_THREADS` to retune), OOM-safe retry, cancel kills the encoder, cache keys versioned so old stream-copy files never replay, UI render timeout raised to 15 min. E2E-verified: first packet is a keyframe, zero decoder errors, exact durations, PSNR 44.9 dB frame alignment vs source.
 - **2.5** — **instant cut + preview on the download cards**: the cut step does zero work (cards appear immediately), every clip card embeds the 360p YouTube preview at the exact timestamp, and downloads render lazily per-card at click-time with in-card progress.

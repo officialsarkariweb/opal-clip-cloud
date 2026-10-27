@@ -195,7 +195,8 @@ function cancelRenders(fromBack){Object.keys(S.rend).forEach(k=>{const R=S.rend[
 function cardUI(i){const c=S.clips[i];if(!c)return;const mt=$('#mt'+i);if(!mt)return;
  const R=S.rend[i];
  if(R){const ql=R.q==='audio'?'audio':R.q+'p';
-  mt.innerHTML=`${fmt(c.a)} to ${fmt(c.b)} · <span style="color:var(--blue)">${R.p>0&&R.p<100?`rendering ${ql} · ${R.p}%`:`rendering ${ql}…`}</span>`}
+  mt.innerHTML=`${fmt(c.a)} to ${fmt(c.b)} · <span style="color:var(--blue)">${R.p>0&&R.p<100?`rendering ${ql} · ${R.p}%`:`rendering ${ql}…`}</span> · <a href="#" id="cx${i}" style="color:var(--mut);text-decoration:underline">cancel</a>`;
+  const cx=$('#cx'+i);if(cx)cx.onclick=ev=>{ev.preventDefault();const RR=S.rend[i];if(RR){RR.dead=true;if(RR.id)fetch('/api/job/'+RR.id,{method:'DELETE'}).catch(()=>{})}}}
  else{mt.innerHTML=`${fmt(c.a)} to ${fmt(c.b)}${c.rd?` · real ${fmt(c.rd)}`:''}${c.audio?' · audio':(c.h?` · ${c.h}p`:'')} · <span id="sz${i}"></span>`;upd()}
  const rb=$('#rb'+i);if(rb){rb.hidden=!R;const rp=$('#rp'+i);if(R&&rp)rp.style.width=Math.max(3,R.p)+'%'}}
 function startClipRender(i,q){
@@ -214,7 +215,12 @@ function startClipRender(i,q){
      c.f=f.url||'';c.z=+f.size||0;c.rd=+v.duration||0;c.h=+v.height||0;c.audio=q==='audio';c.rqH=q;break}
     if(j.status==='error'||j.status==='cancelled')throw new Error(j.error||'Render failed');
     R.p=Math.max(R.p,Math.min(99,Math.round(+j.progress||0)));cardUI(i);
-    if(Date.now()-t0>900000)throw new Error('Render timed out — try a shorter clip or a lower quality')}
+    // v2.8: big renders legitimately take long on the shared CPU — the wait
+    // scales with quality (4K up to 45 min) and the card always shows live
+    // percent + a cancel link, so waiting never looks like being stuck
+    const qv=QH[q]===undefined?2160:QH[q];
+    const waitMs=q==='audio'?600000:(qv>=1440?2700000:1200000);
+    if(Date.now()-t0>waitMs)throw new Error('Render timed out — try a shorter clip or a lower quality')}
   }catch(e){R.err=String(e.message||'Render failed');
    if(R.id&&!/cancel/i.test(R.err))fetch('/api/job/'+R.id,{method:'DELETE'}).catch(()=>{})}
   delete S.rend[i];cardUI(i);

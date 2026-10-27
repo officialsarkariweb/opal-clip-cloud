@@ -2,8 +2,9 @@
 'use strict';
 /* ============================================================================
    Opal Clip Cloud — zero-dependency YouTube clipper built for Render free tier
-   Target: 512MB RAM | 24x7 (self-ping) | speed-first frame-exact re-encode at
-   download time (ultrafast x264, capped at MAX_RENDER_H; audio-only stays remuxed)
+   Target: 512MB RAM | 24x7 (self-ping) | frame-exact renders up to 4K —
+   chunked section download + chunked encode (per-chunk retry, always-moving
+   progress) at download time; audio-only stays remuxed
    ============================================================================ */
 
 const http = require('http');
@@ -46,17 +47,25 @@ const CFG = {
   analyzeCacheTtlMs: Math.max(10, +(process.env.ANALYZE_TTL_MIN || 720)) * 60 * 1000,
   clipCacheTtlMs: Math.max(10, +(process.env.CLIP_TTL_MIN || 360)) * 60 * 1000,
   clipCacheMaxBytes: Math.max(0, +(process.env.CLIP_CACHE_MB || 300)) * 1024 * 1024,
-  // --- download-time render (frame-exact re-encode, v2.7: speed-first) ---
+  // --- download-time render (frame-exact, v2.8: quality-first, up to 4K) ---
   ffmpegPath: process.env.FFMPEG_PATH || 'ffmpeg',
   prerollSec: Math.max(0, +(process.env.PREROLL_SEC || 4)),
-  // never fetch/encode pixels above this height on the free tier (speed + RAM);
-  // raise MAX_RENDER_H on a bigger instance to allow 1440p/4K renders
-  maxRenderH: Math.min(2160, Math.max(144, parseInt(process.env.MAX_RENDER_H, 10) || 1080)),
+  // v2.8: the default cap is the SOURCE max — 1440p/4K requests render at
+  // their real height (the chunked encoder keeps RAM bounded and progress
+  // moving). Clamp MAX_RENDER_H only on deliberately tiny instances.
+  maxRenderH: Math.min(2160, Math.max(144, parseInt(process.env.MAX_RENDER_H, 10) || 2160)),
   ytdlpTimeoutMs: Math.max(1, +(process.env.YT_TIMEOUT_MIN || 15)) * 60 * 1000,
   encodePreset: (process.env.ENCODE_PRESET || '').trim(),  // override the auto ladder
   encodeCrf: Math.max(0, parseInt(process.env.ENCODE_CRF, 10) || 0),
   encodeThreads: Math.max(0, parseInt(process.env.ENCODE_THREADS, 10) || 0),
+  // base encode budget for <=1080p; 1440p gets x1.75 and 4K x2.5 automatically
   encodeTimeoutMs: Math.max(5, +(process.env.ENCODE_TIMEOUT_MIN || 16)) * 60 * 1000,
+  // v2.8 chunk system: big renders (>1080p or long clips) are encoded in
+  // CHUNK_SEC-second pieces and joined — bounded RAM, per-chunk retry, and
+  // progress that visibly advances chunk by chunk (never looks stuck)
+  chunkSec: Math.max(4, +(process.env.CHUNK_SEC || 10)),
+  // a downloader/encoder that goes silent this long is wedged -> kill + retry
+  stallMs: Math.max(30, +(process.env.STALL_SEC || 90)) * 1000,
 };
 
 const state = {
@@ -609,8 +618,12 @@ function activeProxy() {
 }
 
 function ytBaseArgs() {
-  const args = ['--no-playlist', '--no-warnings', '--newline', '--retries', '5',
-    '--fragment-retries', '5', '--socket-timeout', '20'];
+  const args = ['--no-playlist', '--no-warnings', '--newline', '--retries', '8',
+    '--fragment-retries', '8', '--socket-timeout', '25',
+    // yt-dlp 2026.x needs a JS runtime to parse YouTube's player code (deno is
+    // its default, but the deploy image already ships node 24 — use it, else
+    // some formats silently go missing)
+    '--js-runtimes', 'node'];
   const proxy = activeProxy();
   if (proxy) args.push('--proxy', proxy);
   if (state.cookiesFile) args.push('--cookies', state.cookiesFile);
@@ -618,26 +631,29 @@ function ytBaseArgs() {
 }
 
 // format chain for the SECTION download: best video + best audio ranked purely
-// by quality at the chosen cap. This intermediate is stream-copy (fast, ~0 CPU);
-// the frame-exact render happens afterwards in runFfmpegEncode(). The old
-// container-first chain could silently cap quality (e.g. 4K VP9-only videos
-// falling back to a 1080p MP4), so the ranking stays pure-quality.
-// v2.7: the cap itself is clamped to MAX_RENDER_H (default 1080) — on the
-// 512MB/0.1CPU free tier a >1080p re-encode is hopeless-slow and an OOM risk,
-// so pixels above the cap are simply never fetched (the download itself gets
-// several times faster too). H.264 is preferred over VP9/AV1 at the same cap
-// because its decode is 2-4x faster — less wall time before the first encoded
-// frame. The clip card honestly shows the real rendered height.
+// by quality at the chosen height — up to the SOURCE max (4K) in v2.8. This
+// intermediate is stream-copy (fast, ~0 CPU); the frame-exact render happens
+// afterwards (chunked for big renders, single-pass otherwise).
+// H.264 (avc1) decode is 2-4x faster than VP9/AV1, BUT it is only preferred
+// at the EXACT requested height ([height=H]) — a loose [height<=H] would grab
+// YouTube's 1080p avc1 stream for a 2160 request (avc1 tops out at 1080) and
+// silently destroy the whole point of v2.8 (that was this build's first E2E
+// failure: 4K requested, 1080 avc1 served). A miss just falls through to the
+// pure-quality branch, which grabs the real 2160 VP9/AV1.
+// Chunked fetch (v2.8 "stuck-proof"): concurrent fragments + 10MB HTTP range
+// chunks + hard socket timeout, so one stalling connection costs a single
+// chunk, never the whole 4K section.
 function formatArgsFor(height) {
   const H = Math.min(CFG.maxRenderH, Math.min(2160, Math.max(144, height)));
   const f = [
-    `bestvideo*[height<=${H}][vcodec^=avc1]+bestaudio`,
+    `bestvideo*[height=${H}][vcodec^=avc1]+bestaudio`,
     `bestvideo*[height<=${H}]+bestaudio`,
     `best[height<=${H}]`,
     `bestvideo*+bestaudio`,
     `best`,
   ].join('/');
-  return ['-f', f, '--merge-output-format', 'webm/mp4/mkv', '--concurrent-fragments', '4'];
+  return ['-f', f, '--merge-output-format', 'webm/mp4/mkv', '--concurrent-fragments', '6',
+    '--http-chunk-size', '10M'];
 }
 
 function botWallHit(text) {
@@ -693,9 +709,18 @@ function execYt(args, job, progressTo) {
     if (penv) Object.assign(env, penv);
     const child = spawn(CFG.ytdlpPath, args, { stdio: ['ignore', 'pipe', 'pipe'], env });
     const chunksOut = [], chunksErr = [];
+    // v2.8 stall watchdog: once the download has STARTED producing output, a
+    // socket-level stall would hang the whole job until the hard timeout.
+    // yt-dlp --newline prints continuously while healthy, so STALL_SEC of
+    // total silence means the connection is wedged -> SIGKILL (jobClip's retry
+    // ladder then re-runs the download). Watchdog only arms AFTER the first
+    // output line so pure metadata extraction (silent by design) is never killed.
+    let armed = false, lastActivity = Date.now();
     child.stdout.on('data', (d) => {
       chunksOut.push(d); if (chunksOut.length > 400) chunksOut.shift();
       const text = d.toString();
+      lastActivity = Date.now();
+      if (!armed && text.trim()) armed = true;
       if (job && progressTo) {
         const m = text.match(/\[download\]\s+([\d.]+)%/);
         if (m) {
@@ -710,8 +735,16 @@ function execYt(args, job, progressTo) {
     });
     child.stderr.on('data', (d) => {
       chunksErr.push(d); if (chunksErr.length > 200) chunksErr.shift();
+      lastActivity = Date.now();
       if (job) { const t = d.toString(); for (const line of t.split('\n')) if (/error|warning/i.test(line)) jobLog(job, line); }
     });
+    const stall = setInterval(() => {
+      if (armed && child.exitCode === null && Date.now() - lastActivity > CFG.stallMs) {
+        if (job) jobLog(job, `download stalled ${Math.round((Date.now() - lastActivity) / 1000)}s with no data — killing (retry takes over)`);
+        try { child.kill('SIGKILL'); } catch {}
+        clearInterval(stall);
+      }
+    }, 10000);
     child.on('error', (e) => resolve({ code: 1, stdout: '', stderr: String(e.message) }));
     child.on('close', (code) => {
       const stdout = Buffer.concat(chunksOut).toString(), stderr = Buffer.concat(chunksErr).toString();
@@ -720,7 +753,7 @@ function execYt(args, job, progressTo) {
     if (job) childByJob.set(job.id, child);
     // hung downloads must not jam the 1-slot queue for an hour (v2.7)
     const t = setTimeout(() => { try { child.kill('SIGKILL'); } catch {} }, CFG.ytdlpTimeoutMs);
-    child.on('close', () => { clearTimeout(t); if (job) childByJob.delete(job.id); });
+    child.on('close', () => { clearTimeout(t); clearInterval(stall); if (job) childByJob.delete(job.id); });
   });
 }
 
@@ -778,31 +811,47 @@ async function jobAnalyze(job) {
 //     EXACT requested frame (not the previous keyframe)
 //   * audio is re-encoded to AAC -> priming-sample drift / desync disappears
 //   * -movflags +faststart -> moov atom at the front -> playback starts at once
-// v2.7 SPEED-FIRST settings: veryfast measured MINUTES per short clip on the
-// free tier's shared CPU; ultrafast encodes 3-5x faster, and its near-zero
-// lookahead/reference buffers keep RAM far from the 512MB OOM line. crf 23 is
-// visually clean on a phone. Threads follow the REAL cgroup CPU quota.
+// v2.7 SPEED notes kept for history: veryfast measured MINUTES per short clip
+// on the free tier's shared CPU; ultrafast encodes 3-5x faster, and its
+// near-zero lookahead/reference buffers keep RAM far from the 512MB OOM line.
+// v2.8 QUALITY-FIRST: the 1080p cap is GONE — heights render at their real
+// value up to 4K, crf drops one step (more bits per pixel), and >1080p renders
+// go through the CHUNKED encoder (bounded RAM + per-chunk retry + progress
+// that always moves). Threads follow the REAL cgroup CPU quota; >=1440p clamps
+// to 2 so x264's 4K frame buffers stay clear of the OOM line (retry drops to 1).
 // Override per deploy with ENCODE_PRESET / ENCODE_CRF / ENCODE_THREADS.
 function encodeSettings(h, attempt) {
   const preset = CFG.encodePreset || 'ultrafast';
-  const crf = CFG.encodeCrf || 23;
+  const crf = CFG.encodeCrf || (h >= 1440 ? 20 : 21);
   let threads = CFG.encodeThreads || DETECTED_CPUS;
+  if (h >= 1440) threads = Math.min(threads, 2);
   if (attempt > 0) threads = 1; // memory-safe retry
   return { preset, crf, threads };
+}
+
+// total encode budget scales with resolution: 4K on a 0.1-CPU quota is a
+// WAIT, not a failure — the timeout only exists so a wedged encoder can never
+// jam the single worker slot forever (the stall watchdog kills true hangs far
+// earlier than this).
+function encodeTimeoutMsFor(h) {
+  const mult = h >= 2160 ? 2.5 : h >= 1440 ? 1.75 : 1;
+  return Math.round(CFG.encodeTimeoutMs * mult);
 }
 
 function encodeArgs(src, out, trimStart, want, meta, title, attempt) {
   const { preset, crf, threads } = encodeSettings(meta.height, attempt);
   const fps = meta.fps > 0 ? meta.fps : 30;
   const g = Math.max(24, Math.min(120, Math.round(fps * 2))); // ~2s GOP: smooth scrubbing
+  const decThreads = Math.max(1, Math.min(2, threads)); // decoder (VP9/AV1) threads too
   return [
     '-y', '-hide_banner', '-nostdin', '-loglevel', 'error', '-stats',
+    '-threads', String(decThreads), // input-side: caps the DECODER's thread pool
     '-ss', trimStart.toFixed(3), '-i', src, '-t', want.toFixed(3),
     '-map', '0:v:0', '-map', '0:a:0?',
     '-c:v', 'libx264', '-preset', preset, '-crf', String(crf),
     '-pix_fmt', 'yuv420p', '-g', String(g),
     ...(threads ? ['-threads', String(threads)] : []),
-    '-c:a', 'aac', '-b:a', ((meta.height || 0) >= 1080 ? '160k' : '128k'),
+    '-c:a', 'aac', '-b:a', ((meta.height || 0) >= 1440 ? '192k' : (meta.height || 0) >= 720 ? '160k' : '128k'),
     '-movflags', '+faststart', '-avoid_negative_ts', 'make_zero',
     '-metadata', `title=${title}`,
     out,
@@ -813,10 +862,15 @@ function encodeArgs(src, out, trimStart, want, meta, title, attempt) {
 // Progress comes from the `time=` stats line so the UI's live
 // "rendering 480p · 47%" keeps moving through the encode phase. The child is
 // registered in childByJob so DELETE /api/job/:id (cancel) kills the encoder.
-function runFfmpegEncode(args, job, { from, to, want }) {
+// v2.8: per-call timeoutMs (height-aware render budget), optional phaseText
+// ("encoding 2160p · chunk 3/5"), and an encoder stall watchdog — a starved
+// 0.1-CPU still advances time= every second or two, so STALL_SEC+60 of total
+// silence means the encoder is wedged -> SIGKILL (retry ladder takes over).
+function runFfmpegEncode(args, job, { from, to, want, timeoutMs, phaseText }) {
   return new Promise((resolve) => {
     const child = spawn(CFG.ffmpegPath, args, { stdio: ['ignore', 'pipe', 'pipe'] });
     let err = '';
+    let lastTime = -1, lastMove = Date.now();
     child.stderr.on('data', (d) => {
       const t = d.toString();
       err = (err + t).slice(-6000);
@@ -824,20 +878,152 @@ function runFfmpegEncode(args, job, { from, to, want }) {
         const m = t.match(/time=(\d+):(\d+):(\d+(?:\.\d+)?)/);
         if (m) {
           const sec = (+m[1]) * 3600 + (+m[2]) * 60 + (+m[3]);
+          if (sec !== lastTime) { lastTime = sec; lastMove = Date.now(); }
           const pct = from + Math.min(0.999, sec / want) * (to - from);
-          if (pct > job.progress) { job.progress = pct; job.phase = 'encoding'; }
+          if (pct > job.progress) { job.progress = pct; job.phase = phaseText || 'encoding'; }
         }
       }
       if (job) {
         for (const line of t.split('\n')) if (line.trim() && /error|invalid|corrupt|fail/i.test(line)) jobLog(job, line.slice(0, 200));
       }
     });
+    const stall = setInterval(() => {
+      if (child.exitCode === null && Date.now() - lastMove > CFG.stallMs + 60000) {
+        if (job) jobLog(job, 'encoder stalled — killing (retry takes over)');
+        try { child.kill('SIGKILL'); } catch {}
+        clearInterval(stall);
+      }
+    }, 15000);
     child.on('error', (e) => resolve({ code: 1, err: String((e && e.message) || e) }));
     child.on('close', (code) => resolve({ code: code === null ? 1 : code, err }));
     if (job) childByJob.set(job.id, child);
-    const t = setTimeout(() => { try { child.kill('SIGKILL'); } catch {} }, CFG.encodeTimeoutMs);
+    const t = setTimeout(() => { try { child.kill('SIGKILL'); } catch {} }, Math.max(60000, timeoutMs || CFG.encodeTimeoutMs));
+    child.on('close', () => { clearTimeout(t); clearInterval(stall); if (job) childByJob.delete(job.id); });
+  });
+}
+
+// plain ffmpeg run (concat / audio / mux steps — no progress expectations,
+// just the deadline + cancel wiring)
+function runFfmpegSimple(args, job, timeoutMs) {
+  return new Promise((resolve) => {
+    const child = spawn(CFG.ffmpegPath, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+    let err = '';
+    child.stderr.on('data', (d) => { err = (err + d.toString()).slice(-4000); });
+    child.on('error', (e) => resolve({ code: 1, err: String((e && e.message) || e) }));
+    child.on('close', (code) => resolve({ code: code === null ? 1 : code, err }));
+    if (job) childByJob.set(job.id, child);
+    const t = setTimeout(() => { try { child.kill('SIGKILL'); } catch {} }, Math.max(60000, timeoutMs || 300000));
     child.on('close', () => { clearTimeout(t); if (job) childByJob.delete(job.id); });
   });
+}
+
+// ---------------------------- chunked render (v2.8) ---------------------------
+// Big renders (>1080p, or any clip longer than ~90s) are encoded in
+// CHUNK_SEC-second VIDEO-ONLY pieces and joined with the concat demuxer:
+//   * RAM stays bounded — every pass is a small independent encode (4K frame
+//     buffers never scale with clip length)
+//   * a failed/OOM-killed chunk is re-run ALONE with 1 thread — not the whole
+//     clip from zero
+//   * progress advances chunk by chunk ("encoding 2160p · chunk 3/5"), so a
+//     genuinely slow 4K render on a 0.1-CPU quota never LOOKS stuck
+//   * every chunk starts with a fresh IDR keyframe, and the concat list pins
+//     EXACT per-chunk durations, so joins are seamless and total duration is
+//     frame-exact
+// Audio is encoded ONCE for the whole range and muxed at the end — no AAC
+// priming-sample clicks at chunk boundaries (chunks carry no audio at all).
+// Any failure here throws and jobClip falls back to the proven single-pass
+// encoder for the same timeline candidate — the empty-file ladder stays intact.
+async function renderChunked(src, dir, out, trimStart, want, meta, title, job, deadline) {
+  const CHUNK = CFG.chunkSec;
+  const n = Math.max(2, Math.ceil(want / CHUNK));
+  const { preset, crf, threads } = encodeSettings(meta.height, 0);
+  const fps = meta.fps > 0 ? meta.fps : 30;
+  const g = Math.max(24, Math.min(120, Math.round(fps * 2)));
+  const decThreads = Math.max(1, Math.min(2, threads));
+  const span = 96 - 70; // progress real estate for the whole encode phase
+  const chunkFiles = [];
+  const listLines = [];
+  try {
+    for (let i = 0; i < n; i++) {
+      if (job.status === 'cancelled') throw new Error('cancelled');
+      const cs = trimStart + i * CHUNK;
+      const cd = Math.min(CHUNK, want - i * CHUNK);
+      const cpath = path.join(dir, `chunk_${String(i).padStart(3, '0')}.mp4`);
+      chunkFiles.push(cpath);
+      const from = 70 + (span * i) / n, to = 70 + (span * (i + 1)) / n;
+      const phaseText = `encoding ${meta.height}p · chunk ${i + 1}/${n}`;
+      let ok = false;
+      for (let attempt = 0; attempt < 2 && !ok; attempt++) {
+        const remaining = Math.max(60000, deadline - Date.now());
+        const args = [
+          '-y', '-hide_banner', '-nostdin', '-loglevel', 'error', '-stats',
+          '-threads', String(decThreads),
+          '-ss', cs.toFixed(3), '-i', src, '-t', cd.toFixed(3),
+          '-map', '0:v:0', '-an',
+          '-c:v', 'libx264', '-preset', preset, '-crf', String(crf),
+          '-pix_fmt', 'yuv420p', '-g', String(g), '-threads', String(attempt > 0 ? 1 : threads),
+          '-avoid_negative_ts', 'make_zero',
+          cpath,
+        ];
+        if (attempt > 0) jobLog(job, `chunk ${i + 1}/${n} failed — retrying with 1 encoder thread (RAM-safe)`);
+        const r = await runFfmpegEncode(args, job, { from, to: to - 0.5, want: cd, timeoutMs: remaining, phaseText });
+        const st = await fsp.stat(cpath).catch(() => null);
+        ok = r.code === 0 && !!st && st.size >= 8 * 1024;
+        if (!ok) await fsp.rm(cpath, { force: true }).catch(() => {});
+      }
+      if (!ok) throw new Error(`chunk ${i + 1}/${n} failed to encode`);
+      // pin the EXACT duration — the concat demuxer then offsets every chunk
+      // precisely, so joins are seamless and the total length is frame-exact
+      listLines.push(`file '${cpath}'`, `duration ${cd.toFixed(3)}`);
+      jobLog(job, `chunk ${i + 1}/${n} done (${cd.toFixed(1)}s)`);
+    }
+    // ---- join the video chunks (identical codec params -> stream copy) ----
+    job.progress = Math.max(job.progress, 96); job.phase = 'joining chunks';
+    const listPath = path.join(dir, 'chunks.txt');
+    await fsp.writeFile(listPath, listLines.join('\n') + '\n');
+    const videoPath = path.join(dir, 'video.mp4');
+    let r = await runFfmpegSimple(['-y', '-hide_banner', '-nostdin', '-loglevel', 'error',
+      '-f', 'concat', '-safe', '0', '-i', listPath, '-c', 'copy', '-movflags', '+faststart', videoPath],
+      job, Math.max(60000, deadline - Date.now()));
+    let st = await fsp.stat(videoPath).catch(() => null);
+    if (r.code !== 0 || !st || st.size < 8 * 1024) throw new Error('chunk join failed');
+
+    if (meta.hasAudio) {
+      // ---- audio: ONE pass over the exact range (no joins inside audio) ----
+      job.phase = 'encoding audio';
+      const audioPath = path.join(dir, 'audio.m4a');
+      const abr = (meta.height || 0) >= 1440 ? '192k' : (meta.height || 0) >= 720 ? '160k' : '128k';
+      r = await runFfmpegSimple(['-y', '-hide_banner', '-nostdin', '-loglevel', 'error', '-stats',
+        '-threads', String(decThreads),
+        '-ss', trimStart.toFixed(3), '-i', src, '-t', want.toFixed(3),
+        '-map', '0:a:0', '-vn', '-c:a', 'aac', '-b:a', abr, audioPath],
+        job, Math.max(60000, deadline - Date.now()));
+      st = await fsp.stat(audioPath).catch(() => null);
+      if (r.code !== 0 || !st || st.size < 2048) throw new Error('audio track encode failed');
+      // ---- mux video + audio ----
+      job.phase = 'finalizing';
+      r = await runFfmpegSimple(['-y', '-hide_banner', '-nostdin', '-loglevel', 'error',
+        '-i', videoPath, '-i', audioPath,
+        '-map', '0:v:0', '-map', '1:a:0', '-c', 'copy',
+        '-movflags', '+faststart', '-avoid_negative_ts', 'make_zero',
+        '-metadata', `title=${title}`, out],
+        job, Math.max(60000, deadline - Date.now()));
+    } else {
+      // source has no audio — the joined video file IS the result
+      r = await runFfmpegSimple(['-y', '-hide_banner', '-nostdin', '-loglevel', 'error',
+        '-i', videoPath, '-map', '0:v:0', '-c', 'copy',
+        '-movflags', '+faststart', '-metadata', `title=${title}`, out],
+        job, Math.max(60000, deadline - Date.now()));
+    }
+    st = await fsp.stat(out).catch(() => null);
+    if (r.code !== 0 || !st || st.size < 25 * 1024) throw new Error('final mux failed');
+    return { n, chunkSec: CHUNK };
+  } finally {
+    // intermediates never outlive the render (disk stays flat even mid-retry)
+    await Promise.all([...chunkFiles,
+      path.join(dir, 'chunks.txt'), path.join(dir, 'video.mp4'), path.join(dir, 'audio.m4a')]
+      .map((f) => fsp.rm(f, { force: true }).catch(() => {})));
+  }
 }
 
 // ---------------------------- clip job ---------------------------------------
@@ -850,8 +1036,8 @@ function runFfmpegEncode(args, job, { from, to, want }) {
 async function jobClip(job) {
   const { url, start, end, height } = job._input;
   // cache key carries the pipeline version: finished renders replay instantly,
-  // but old stream-copy entries (frozen first GOP) are never reused
-  const ckey = `${videoKeyOf(url)}|${(+start).toFixed(2)}|${(+end).toFixed(2)}|${height}|re2`;
+  // but old entries (capped 1080p / different crf) are never reused
+  const ckey = `${videoKeyOf(url)}|${(+start).toFixed(2)}|${(+end).toFixed(2)}|${height}|re3`;
   const cached = await clipCacheGet(ckey);
   if (cached) {
     job.result = {
@@ -876,7 +1062,14 @@ async function jobClip(job) {
   // start decoding BEFORE the cut and land on the exact first frame
   const want = end - start;
   const secStart = audioOnly ? start : Math.max(0, start - CFG.prerollSec);
-  const outTpl = path.join(dir, 'clip.%(ext)s');
+  // v2.8 CRITICAL FIX: the section template is 'section.%(ext)s' — the old
+  // 'clip.%(ext)s' could COLLIDE with the render output 'clip.mp4' when the
+  // merged section happened to be an MP4 (avc1+m4a, or av1+aac when bestaudio
+  // was m4a). With src === out the single-pass encoder refused to run (ffmpeg
+  // exit 234 — same input/output file) and the chunked path rendered fine but
+  // then `rm(src)` DELETED the finished clip.mp4 -> no cache entry + /file 404.
+  // Distinct namespaces make the collision structurally impossible.
+  const outTpl = path.join(dir, 'section.%(ext)s');
   const args = [
     ...ytBaseArgs(),
     '--download-sections', `*${secStart.toFixed(2)}-${end.toFixed(2)}`,
@@ -886,11 +1079,25 @@ async function jobClip(job) {
     '-o', outTpl,
     url,
   ];
-  const res = await runYt(args, job, audioOnly ? 90 : 65);
+  // v2.8 stuck-proof download: runYt already rotates player clients on the
+  // bot-wall, and execYt's stall watchdog SIGKILLs wedged connections — this
+  // outer ladder catches whatever still fails, wipes the partial files and
+  // re-fetches the exact section once more before giving up
+  let res = null, files = [];
+  for (let dl = 0; dl < 2; dl++) {
+    if (dl > 0) {
+      jobLog(job, 'download attempt 1 failed — retrying (stall or network fault)');
+      job.phase = 'retrying download';
+      await Promise.all((await fsp.readdir(dir)).filter((f) => f.startsWith('section.'))
+        .map((f) => fsp.rm(path.join(dir, f), { force: true }).catch(() => {})));
+    }
+    res = await runYt(args, job, audioOnly ? 90 : 65);
+    files = (await fsp.readdir(dir)).filter((f) => f.startsWith('section.'));
+    if (res.code === 0 && files.length) break;
+    if (job.status === 'cancelled') break;
+  }
   const combined = res.stdout + res.stderr;
   if (res.code !== 0) throw httpErr(422, friendlyYtError(combined || `yt-dlp exited ${res.code}`));
-
-  const files = (await fsp.readdir(dir)).filter((f) => f.startsWith('clip.'));
   if (!files.length) throw httpErr(422, 'Download finished but no output file was produced.');
   const src = path.join(dir, files[0]);
   const st0 = await fsp.stat(src);
@@ -974,16 +1181,40 @@ async function jobClip(job) {
     preset: ladder.preset, crf: ladder.crf,
     attempts: [],
   };
+  // v2.8 chunk system: >1080p (or long clips) render chunk-by-chunk — bounded
+  // RAM, per-chunk retry, progress that always moves; short <=1080p clips go
+  // straight to the proven single-pass path (chunking would be pure overhead)
+  const useChunks = (meta.height > 1080 || want > 90) && want > CFG.chunkSec + 2;
+  const deadline = Date.now() + encodeTimeoutMsFor(meta.height);
   let om = null, st1 = null, lastWhy = '';
   for (let attempt = 0; attempt < candidates.length; attempt++) {
     const cand = candidates[attempt];
     job.phase = attempt === 0 ? 'encoding' : `encoding (retry ${attempt})`;
     if (attempt > 0) jobLog(job, `encode retry ${attempt}: timeline '${cand.tag}', trim ${cand.trim.toFixed(2)}s`);
-    const enc = await runFfmpegEncode(encodeArgs(src, out, cand.trim, cand.dur, meta, title, attempt), job, { from: 70, to: 96, want: cand.dur });
-    renderInfo.attempts.push(`${cand.tag}:exit${enc.code}`);
+    // chunked first (big renders); ANY failure falls back to single-pass for
+    // the same timeline candidate — the empty-file ladder stays intact
+    let encCode = 0;
+    const chunked = useChunks && await (async () => {
+      try {
+        renderInfo.chunks = await renderChunked(src, dir, out, cand.trim, cand.dur, meta, title, job, deadline);
+        return true;
+      } catch (e) {
+        jobLog(job, `chunked render failed: ${String((e && e.message) || e).slice(0, 140)} — single-pass fallback`);
+        return false;
+      }
+    })();
+    if (!chunked) {
+      const enc = await runFfmpegEncode(encodeArgs(src, out, cand.trim, cand.dur, meta, title, attempt), job, { from: 70, to: 96, want: cand.dur, timeoutMs: Math.max(60000, deadline - Date.now()) });
+      encCode = enc.code;
+      if (encCode !== 0) {
+        const tail = (enc.err || '').split('\n').filter(Boolean).slice(-2).join(' ').slice(0, 140);
+        lastWhy = `ffmpeg exit ${encCode}` + (/killed|signal|abort|memory|cannot allocate/i.test(enc.err || '') ? ' (out of memory)' : '') + (tail ? `: ${tail}` : '');
+      }
+    }
+    renderInfo.attempts.push(`${cand.tag}:${chunked ? 'chunks' : 'single'}:exit${chunked ? 0 : encCode}`);
     st1 = await fsp.stat(out).catch(() => null);
     const sizeOk = !!st1 && st1.size >= 25 * 1024;
-    if (enc.code === 0 && sizeOk) {
+    if (encCode === 0 && sizeOk) {
       job.progress = 97; job.phase = 'finalizing';
       om = await probeVideo(out);
       // HARD gate (v2.6 only logged a note here — truncation reached users):
@@ -997,8 +1228,8 @@ async function jobClip(job) {
       }
       lastWhy = `invalid output (duration ${(om.duration || 0).toFixed(2)}s, height ${om.height || 0})`;
       om = null;
-    } else if (enc.code !== 0) {
-      lastWhy = `ffmpeg exit ${enc.code}` + (/killed|signal|abort|memory|cannot allocate/i.test(enc.err || '') ? ' (out of memory)' : '');
+    } else if (encCode !== 0) {
+      lastWhy = lastWhy || `ffmpeg exit ${encCode}`;
     } else {
       lastWhy = `output too small (${st1 ? st1.size : 0} bytes)`;
     }
@@ -1047,12 +1278,14 @@ function probeVideo(file) {
       try {
         const j = JSON.parse(out);
         const v = (j.streams || []).find((s) => s.codec_type === 'video') || {};
+        const hasAudio = (j.streams || []).some((s) => s.codec_type === 'audio');
         const rf = String(v.r_frame_rate || '').match(/^(\d+)\s*\/\s*(\d+)$/);
         resolve({
           height: v.height || 0, width: v.width || 0,
           codec: v.codec_name || '',
           duration: Math.round(parseFloat((j.format || {}).duration || v.duration || 0) * 100) / 100,
           fps: (rf && +rf[2] > 0) ? (+rf[1] / +rf[2]) : 0,
+          hasAudio,
         });
       } catch { resolve({}); }
     });
@@ -1475,7 +1708,7 @@ const server = http.createServer(async (req, res) => {
         jobs: { running: runningCount, queued: queue.length },
         warp: { enabled: CFG.warp, active: !!state.connectProxyUrl, error: state.warpError.slice(0, 140) },
         cookies: !!state.cookiesFile,
-        ytdlp: state.ytdlpVersion || '', version: '2.7.0',
+        ytdlp: state.ytdlpVersion || '', version: '2.8.0',
         caches: {
           analyze: analyzeCache.size,
           clips: clipCache.size,
@@ -1490,7 +1723,9 @@ const server = http.createServer(async (req, res) => {
       return sendJson(res, 200, {
         maxClipSeconds: CFG.maxClipSeconds,
         authRequired: !!CFG.apiKey,
-        version: '2.7.0',
+        maxHeight: CFG.maxRenderH,
+        chunkedRender: true,
+        version: '2.8.0',
       });
     }
 

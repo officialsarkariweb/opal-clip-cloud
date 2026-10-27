@@ -1,6 +1,6 @@
 {
   "name": "opal-clip-cloud",
-  "version": "2.7.0",
+  "version": "2.8.0",
   "description": "Lightweight YouTube video clipper \u2014 zero-dependency Node.js server for Render free tier (512MB, 24x7, speed-first frame-exact H.264 re-encode at click-time: ultrafast preset + cgroup-aware threads + resolution cap so clips render in seconds instead of minutes, timeline-candidate retry ladder so a render can never come back empty or truncated, audio-only tracks stay remuxed, 3-layer caching, 360p YouTube previews on every clip card)",
   "main": "server.js",
   "scripts": {
